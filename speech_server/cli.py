@@ -124,6 +124,7 @@ ENV_FLAGS = [
     (("serve",), "--modes", "MODES", "value"),
     (("serve",), "--precisions", "PRECISIONS", "value"),
     (("serve",), "--decodes", "DECODES", "value"),
+    (("serve",), "--stats", "STATS", "bool"),
     (("serve",), "--host", "HOST", "value"),
     (("serve",), "--port", "PORT", "value"),
     (("serve",), "--max-streams", "MAX_STREAMS", "value"),
@@ -601,26 +602,30 @@ def cmd_serve(a) -> None:
     os.environ.pop(cfg.get("_token_env") or "HF_TOKEN", None)
     if a.share_encoder is None:
         a.share_encoder = True
-    modes = list(dict.fromkeys(m.strip() for m in (a.modes or cfg["mode"]).split(",") if m.strip()))
+    modes = list(dict.fromkeys(m.strip() for m in (a.modes if a.modes is not None else cfg["mode"]).split(",")
+                               if m.strip()))
     if not modes or any(m not in ("decoder", "ctc") + STREAM_MODES for m in modes):
         sys.exit("--modes takes decoder, ctc, ctc-stream and/or dec-stream")
     if a.stream_model and "ctc-stream" not in modes:
         modes.append("ctc-stream")
     # command line / env first (--decodes, or --decode alone), then --config's decodes, then the config's decode
-    raw_dec = a.decodes or (None if getattr(a, "decode", None) else cfg.get("decodes"))
+    raw_dec = a.decodes if a.decodes is not None else (None if getattr(a, "decode", None) is not None
+                                                        else cfg.get("decodes"))
     if isinstance(raw_dec, (list, tuple)):
         raw_dec = ",".join(str(x) for x in raw_dec)
     if raw_dec is not None and not isinstance(raw_dec, str):
         sys.exit("decodes must be a comma list (or a JSON list) of greedy / beam")
-    decodes = list(dict.fromkeys(d.strip() for d in (raw_dec or cfg["decode"]).split(",") if d.strip()))
+    decodes = list(dict.fromkeys(d.strip() for d in (cfg["decode"] if raw_dec is None else raw_dec).split(",")
+                                 if d.strip()))
     if not decodes or any(d not in ("greedy", "beam") for d in decodes):
         sys.exit("--decodes takes greedy and/or beam")
-    if raw_dec and "decoder" not in modes and decodes != ["greedy"]:
+    if raw_dec is not None and "decoder" not in modes and decodes != ["greedy"]:
         sys.exit("--decodes lists decoder search kinds; serve mode decoder too (--modes)")
     cfg["decode"] = decodes[0]                     # the default; ?decode= picks among them per request
     if len(decodes) > 1:
         cfg["_explicit"] = sorted(set(cfg.get("_explicit", [])) | {"decode"})
-    precs = list(dict.fromkeys(p.strip() for p in (a.precisions or cfg["precision"]).split(",") if p.strip()))
+    precs = list(dict.fromkeys(p.strip() for p in (a.precisions if a.precisions is not None else cfg["precision"])
+                               .split(",") if p.strip()))
     if not precs or any(p not in ("fp32", "fp16", "int8") for p in precs):
         sys.exit("--precisions takes fp32, fp16 and/or int8")
     if cfg["device"] == "cpu" and "fp16" in precs:   # asked for explicitly: served, but say what it costs
@@ -641,6 +646,29 @@ def cmd_serve(a) -> None:
     stream_eng = next(iter(live_engs.values()), None)
     queues = {k: queue.Queue() for k in engines}
     run_lock = threading.Lock()                    # one engine runs at a time: the thread budget is per server
+    # --stats counters (GET /stats): micro-batches per engine and 503 answers; numbers only, never request content
+    counters = {"t0": time.time(), "batches": {}, "http_503": 0, "conn_limit_503": 0}
+    counters_lock = threading.Lock()
+
+    def stats_view() -> dict:
+        """GET /stats: what each engine did and the limits it runs with (after the memory clamp); numbers only."""
+        with counters_lock:
+            mb = {k: tuple(v) for k, v in counters["batches"].items()}
+            out = {"uptime_s": round(time.time() - counters["t0"], 1), "http_503": counters["http_503"],
+                   "conn_limit_503": counters["conn_limit_503"]}
+        rows = []
+        for (m, p), e in engines.items():
+            st, (n, r) = getattr(e, "stats", None), mb.get((m, p), (0, 0))
+            rows.append({"mode": m.split(":")[0], "precision": p, "decode": getattr(e, "decode_kind", None),
+                         "max_batch_seconds": getattr(e, "max_batch_seconds", None),
+                         "kv_budget_mb": getattr(e, "kv_budget_mb", None),
+                         "decode_batch": getattr(e, "decode_batch", None),
+                         "micro_batches": n, "requests": r, "mean_micro_batch": round(r / n, 2) if n else None,
+                         "engine": {k: round(float(getattr(st, k)), 3) for k in
+                                    ("audio_seconds", "windows", "encode_s", "decode_s", "steps", "tokens", "wall_s",
+                                     "batches")} if st is not None else None})
+        out["engines"] = rows
+        return out
     streams = threading.BoundedSemaphore(a.max_streams)      # live sessions, server-wide (no per-IP limits: behind
     preauth = {"n": 0, "lock": threading.Lock()}               # the proxy every client IP is the same)
     decode_sem = threading.BoundedSemaphore(a.decode_max)      # concurrent upload decodes (ffmpeg / soundfile)
@@ -670,6 +698,10 @@ def cmd_serve(a) -> None:
         eng, jobs = engines[m], queues[m]
 
         def run(batch):                            # decoded arrays (the handler decoded each upload once)
+            with counters_lock:
+                c = counters["batches"].setdefault(m, [0, 0])
+                c[0] += 1
+                c[1] += len(batch)
             with run_lock:
                 for j, r in zip(batch, eng.transcribe([j[0] for j in batch], options=[j[1] for j in batch])):
                     j[2].update({k: v for k, v in r.items() if k != "tokens"})
@@ -732,6 +764,9 @@ def cmd_serve(a) -> None:
             return hmac.compare_digest(got.encode(), key.encode())
 
         def _send(self, code, obj, ctype="application/json; charset=utf-8", extra=None):
+            if code == 503:
+                with counters_lock:
+                    counters["http_503"] += 1
             b = obj if isinstance(obj, bytes) else (obj.encode() if isinstance(obj, str) else
                                                     json.dumps(obj, ensure_ascii=False).encode())
             self.send_response(code)
@@ -756,6 +791,12 @@ def cmd_serve(a) -> None:
                                         "decodes": facts["decodes"],
                                         "engines": [{"mode": m.split(":")[0], "precision": p, "decode": e.decode_kind}
                                                     for (m, p), e in engines.items()]})
+            if u.path == "/stats":                   # opt-in (--stats), behind the API key: serving counters only
+                if not a.stats:
+                    return self._send(404, {"error": "not found"})
+                if not self._auth():
+                    return self._send(401, {"error": "unauthorized"})
+                return self._send(200, stats_view())
             if u.path == "/help":                    # no auth, as /health: documentation and served facts only
                 qs = urllib.parse.parse_qs(u.query)
                 fmt = qs.get("format", ["markdown"])[0]
@@ -1137,6 +1178,8 @@ def cmd_serve(a) -> None:
                 if not over:
                     self.active += 1
             if over:
+                with counters_lock:
+                    counters["conn_limit_503"] += 1
                 try:
                     request.setblocking(False)
                     request.send(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -1273,6 +1316,9 @@ def main(argv=None) -> None:
                    "--model-repo; env STREAM_MODEL_REPO")
     s.add_argument("--stream-model-revision", help="branch, tag or commit of --stream-model-repo; env "
                    "STREAM_MODEL_REVISION")
+    s.add_argument("--stats", action=argparse.BooleanOptionalAction, default=False,
+                   help="serve GET /stats (needs the API key): per-engine timings, effective batch limits, "
+                   "micro-batch sizes and 503 counts, for tuning; default off; env STATS")
     s.add_argument("--share-encoder", action=argparse.BooleanOptionalAction, default=None,
                    help="decoder and ctc share one encoder session (one copy of the encoder weights), and ctc-stream "
                    "/ dec-stream share their chunk encoder (default: on; --no-share-encoder loads one per mode); env "

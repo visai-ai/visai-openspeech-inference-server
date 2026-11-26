@@ -20,6 +20,7 @@ x-common: &common
     MODES: ${MODES:-}
     DECODE: ${DECODE:-}
     DECODES: ${DECODES:-}
+    STATS: ${STATS:-}
     BEAM: ${BEAM:-}
     PRECISION: ${PRECISION:-}
     PRECISIONS: ${PRECISIONS:-}

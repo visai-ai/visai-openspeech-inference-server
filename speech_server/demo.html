@@ -465,7 +465,10 @@ $("live").addEventListener("click", async () => {
   setStatus("Waiting for microphone permission");
   try {                                                // the permission prompt comes first, before any socket
     L.mic = await micSource(16000);
-  } catch (e) { note($("micNote"), "Microphone unavailable: " + e.message, true); resetLive(); setStatus(""); return; }
+  } catch (e) {
+    if (S.live !== L) return;                          // a newer session took over meanwhile: leave it alone
+    note($("micNote"), "Microphone unavailable: " + e.message, true); resetLive(); setStatus(""); return;
+  }
   if (S.live !== L) { L.mic.stop(); return; }
   const rs = Resampler(L.mic.ctx.sampleRate);
   L.mic.proc.onaudioprocess = (e) => {                 // audio flows only once the server said ready
@@ -514,6 +517,7 @@ $("live").addEventListener("click", async () => {
 
 async function liveFailed(L) {                         // the handshake failed: a busy server (503) or a proxy problem
   if (L.mic) { L.mic.stop(); L.mic = null; }
+  if (S.live !== L) return;                            // a stale session: the current one keeps the page
   resetLive(); setStatus("");
   let busy = false;
   try { busy = (await fetch("stream")).status === 503; } catch (e) { /* unreachable: treat as a proxy problem */ }

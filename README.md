@@ -287,8 +287,9 @@ ffmpeg is optional: it adds M4A / MP4 / WebM / AAC / AMR uploads (WAV, FLAC, OGG
 
 GPU memory: the encoder runs a whole batch of 30 s windows at once (`--batch-size`, `--max-batch-seconds`), inside the
 cap `--gpu-mem-limit-mb`, which also limits the seconds per batch (about twice as tightly for fp32 graphs as for fp16).
-If a GPU still runs out of memory on dense 30 s audio, lower `--max-batch-seconds` (for example 120-180), or raise the
-cap toward the GPU's size so ONNX Runtime may use more of it (for example 28000 on a 32 GB GPU).
+After each encoder batch the server hands the encoder's GPU memory back to its pool (ONNX Runtime arena shrinkage), so
+memory does not fragment over a long run of differently sized batches; this costs a few percent of throughput. If a
+GPU still runs out of memory, lower `--max-batch-seconds`, or raise the cap toward the GPU's size.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
@@ -334,6 +335,7 @@ serve --help` lists every flag.
 | `MODE` / `MODES` | `--mode` / `--modes` | `decoder` | served modes, first is the default: `decoder`, `ctc`, `ctc-stream`, `dec-stream` |
 | `DECODE`, `BEAM` | `--decode`, `--beam` | `greedy`, `4` | decoder search (Performance mode: `beam`; beam 1-16) |
 | `DECODES` | `--decodes` | `DECODE` | decoder searches served per request (`?decode=`), e.g. `greedy,beam`; the first is the default |
+| `STATS` | `--stats` | off | serve `GET /stats` (API key required): per-engine timings, effective batch limits after the memory clamp, micro-batch sizes, 503 counts; for tuning |
 | `SHARE_ENCODER` | `--share-encoder` / `--no-share-encoder` | `true` | see [Encoder sharing](#encoder-sharing) |
 | `THREADS` | `--threads` | all cores | CPU threads per engine (set it to your container's CPU limit) |
 | `LANG_DEFAULT` | `--lang` | `auto` | default language prompt (`auto`, `th`, `en`, `zh`) |
@@ -361,6 +363,9 @@ Full reference: `GET /help` on a running server (Markdown; `?format=json` for JS
   the server sends `partial` messages as text appears, and a `final` message after `{"type": "stop"}`, an idle period
   or the session limit.
 - `GET /health`: served modes, precisions and whether live streaming is on (no key needed).
+- `GET /stats` (only with `--stats` / `STATS=true`; needs the key): per-engine counters for tuning (encode / decode
+  seconds, windows, micro-batches and their mean size, the effective `max_batch_seconds` and KV budget, 503 counts).
+  Numbers only: no audio, text or request details.
 
 Put the server behind a TLS-terminating reverse proxy (nginx, Caddy, a cloud load balancer) for anything beyond
 localhost; browsers need HTTPS for the microphone on `/demo`.

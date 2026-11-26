@@ -36,6 +36,19 @@ class TooLong(InputError):
 DEFAULT_MAX_NEW = 448
 
 
+def _canon_providers(providers) -> tuple:
+    """Provider list in a comparable form: option order does not matter, cache paths are resolved."""
+    out = []
+    for p in providers or []:
+        if isinstance(p, tuple):
+            opts = {k: (os.path.realpath(v) if k.endswith("_path") and isinstance(v, str) else str(v))
+                    for k, v in (p[1] or {}).items()}
+            out.append((p[0], tuple(sorted(opts.items()))))
+        else:
+            out.append((str(p), ()))
+    return tuple(out)
+
+
 @dataclass
 class Stats:
     audio_seconds: float = 0.0
@@ -243,6 +256,14 @@ class Engine:
         else:
             self.providers = ["CPUExecutionProvider"]
         self.want = self.providers[0][0] if isinstance(self.providers[0], tuple) else self.providers[0]
+        # GPU: give the encoder's arena memory back after each run. Encoder batches have many different padded
+        # shapes; with kSameAsRequested the arena otherwise fragments over a long run until a ~0.5-1 GB request no
+        # longer fits the encoder's share of --gpu-mem-limit-mb (measured: out of memory after ~30-40 calls of 64 at
+        # 16000 MB, fp32; none with this). Memory only: the numbers computed are the same.
+        self._enc_ro = None
+        if self.dev == "cuda":
+            self._enc_ro = ort.RunOptions()
+            self._enc_ro.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
         self.threads, self.decode_threads, self.graph_opt = threads, decode_threads or threads, graph_opt
         self.gpu_mem_limit_mb = gpu_mem_limit_mb   # hard GPU memory cap (sessions + KV); None = no cap
         self.cut, self.cut_min_blank_ms = cut, cut_min_blank_ms   # long-form cut signal: "energy" | "ctc"
@@ -270,12 +291,14 @@ class Engine:
             if not (getattr(sh, "enc", None) is not None and getattr(sh, "enc_full", False)
                     and os.path.realpath(sh.model_dir) == os.path.realpath(model_dir)
                     and sh.precision == precision and sh.want == self.want and sh.mode in ("decoder", "ctc")
-                    and getattr(sh, "threads", None) == self.threads and getattr(sh, "graph_opt", None) == self.graph_opt
-                    and repr(getattr(sh, "providers", None)) == repr(self.providers)
-                    and getattr(sh, "gpu_mem_limit_mb", None) == self.gpu_mem_limit_mb):
+                    and int(getattr(sh, "threads", 0) or 0) == int(self.threads or 0)
+                    and getattr(sh, "graph_opt", None) == self.graph_opt
+                    and _canon_providers(getattr(sh, "providers", [])) == _canon_providers(self.providers)
+                    and getattr(sh, "gpu_mem_limit_mb", None) == self.gpu_mem_limit_mb
+                    and (encoder_graph == "auto" or encoder_graph == getattr(sh, "encoder_graph", None))):
                 raise ValueError("enc_share: the other engine must hold the full encoder of the same model package, "
                                  "precision, device and session settings (threads, graph_opt, provider options, "
-                                 "GPU memory cap)")
+                                 "GPU memory cap, encoder graph)")
             self.enc, self.encoder_graph, self.enc_shared = sh.enc, sh.encoder_graph, True
             # the decoder graphs are stateless sessions too (cross_kv, ctc_lp, gather, prefill / step): an engine that
             # shares the encoder also reuses every graph the donor already opened with the same settings (e.g. the
@@ -586,7 +609,7 @@ class Engine:
         if name is None:
             raise FileNotFoundError(f"{self.model_dir}: no graph for {role} in this model package")
         # everything that makes a session differ: file, threads, optimisation, device and provider options, memory cap
-        key = (name, int(threads or 0), self.graph_opt, repr(self.providers), self.gpu_mem_limit_mb)
+        key = (name, int(threads or 0), self.graph_opt, _canon_providers(self.providers), self.gpu_mem_limit_mb)
         if key in self._sessions:
             return self._sessions[key]
         so = ort.SessionOptions()
@@ -623,7 +646,7 @@ class Engine:
         io.bind_cpu_input("audio_lens", np.array([len(x)], np.int64))
         for o in self.enc.get_outputs():
             io.bind_output(o.name, "cpu")
-        self.enc.run_with_iobinding(io)
+        self.enc.run_with_iobinding(io, self._enc_ro)
         names = [o.name for o in self.enc.get_outputs()]
         ctc = io.get_outputs()[names.index("ctc_ids")].numpy()[0]
         fr = audiolib.SR * self.spec.encoder.subsampling * self.spec.frontend.hop_length // audiolib.SR  # samples/frame
@@ -1045,7 +1068,7 @@ class Engine:
                 io.bind_output("enc", self.dev)   # and is dropped
             io.bind_output("enc_lens", "cpu")
             io.bind_output("ctc_ids", "cpu")
-            self.enc.run_with_iobinding(io)
+            self.enc.run_with_iobinding(io, self._enc_ro)
             outs = io.get_outputs()
             elen, ctc = outs[-2].numpy(), outs[-1].numpy()
             st.encode_s += time.perf_counter() - t0
@@ -1056,7 +1079,7 @@ class Engine:
         io.bind_output("enc", self.dev)
         io.bind_output("enc_lens", "cpu")
         io.bind_output("ctc_ids", "cpu")
-        self.enc.run_with_iobinding(io)
+        self.enc.run_with_iobinding(io, self._enc_ro)
         outs = io.get_outputs()
         enc, elen = outs[0], outs[1].numpy()
         st.encode_s += time.perf_counter() - t0
@@ -1100,7 +1123,7 @@ class Engine:
         io.bind_output("enc", "cpu")
         io.bind_output("enc_lens", "cpu")
         io.bind_output("ctc_ids", "cpu")
-        self.enc.run_with_iobinding(io)
+        self.enc.run_with_iobinding(io, self._enc_ro)
         enc, elen, ctc = (o.numpy() for o in io.get_outputs())
         clen = np.array([len(_ctc_collapse(ctc[r, : int(elen[r])])) for r in range(B)])
         st.encode_s += time.perf_counter() - t0
@@ -1487,7 +1510,7 @@ class Engine:
         io.bind_output("enc", "cpu")
         io.bind_output("enc_lens", "cpu")
         io.bind_output("ctc_ids", "cpu")
-        self.enc.run_with_iobinding(io)
+        self.enc.run_with_iobinding(io, self._enc_ro)
         outs = io.get_outputs()
         enc, elen, ctc = outs[0].numpy(), outs[1].numpy(), outs[2].numpy()
         st.encode_s += time.perf_counter() - t0
