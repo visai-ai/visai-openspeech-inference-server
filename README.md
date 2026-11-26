@@ -287,9 +287,11 @@ ffmpeg is optional: it adds M4A / MP4 / WebM / AAC / AMR uploads (WAV, FLAC, OGG
 
 GPU memory: the encoder runs a whole batch of 30 s windows at once (`--batch-size`, `--max-batch-seconds`), inside the
 cap `--gpu-mem-limit-mb`, which also limits the seconds per batch (about twice as tightly for fp32 graphs as for fp16).
-After each encoder batch the server hands the encoder's GPU memory back to its pool (ONNX Runtime arena shrinkage), so
-memory does not fragment over a long run of differently sized batches; this costs a few percent of throughput. If a
-GPU still runs out of memory, lower `--max-batch-seconds`, or raise the cap toward the GPU's size.
+Every 8th encoder batch (`--gpu-arena-shrink-every`, env `GPU_ARENA_SHRINK_EVERY`) the server releases the encoder's
+unused GPU memory from ONNX Runtime's arena, so memory does not fragment over a long run of differently sized batches
+(about 1.5% of throughput; `1` releases after every batch, about 5%). With `0` (never) and a `--gpu-mem-limit-mb` cap,
+fp32 graphs can run out of memory after a few dozen batches of varied length; without a cap, on a GPU of its own, `0`
+is fine. If a GPU still runs out of memory, lower `--max-batch-seconds`, or raise the cap toward the GPU's size.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
@@ -335,6 +337,7 @@ serve --help` lists every flag.
 | `MODE` / `MODES` | `--mode` / `--modes` | `decoder` | served modes, first is the default: `decoder`, `ctc`, `ctc-stream`, `dec-stream` |
 | `DECODE`, `BEAM` | `--decode`, `--beam` | `greedy`, `4` | decoder search (Performance mode: `beam`; beam 1-16) |
 | `DECODES` | `--decodes` | `DECODE` | decoder searches served per request (`?decode=`), e.g. `greedy,beam`; the first is the default |
+| `GPU_ARENA_SHRINK_EVERY` | `--gpu-arena-shrink-every` | `8` | GPU: release the encoder's unused arena memory every Nth batch (1 = always, 0 = never); see "GPU memory" |
 | `STATS` | `--stats` | off | serve `GET /stats` (API key required): per-engine timings, effective batch limits after the memory clamp, micro-batch sizes, 503 counts; for tuning |
 | `SHARE_ENCODER` | `--share-encoder` / `--no-share-encoder` | `true` | see [Encoder sharing](#encoder-sharing) |
 | `THREADS` | `--threads` | all cores | CPU threads per engine (set it to your container's CPU limit) |

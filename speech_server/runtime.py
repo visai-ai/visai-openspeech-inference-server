@@ -49,6 +49,9 @@ def _canon_providers(providers) -> tuple:
     return tuple(out)
 
 
+_STATS_LOCK = threading.Lock()   # Stats.add vs Stats.snapshot (GET /stats): never a half-added batch
+
+
 @dataclass
 class Stats:
     audio_seconds: float = 0.0
@@ -61,9 +64,16 @@ class Stats:
     batches: int = 0
     extra: dict = field(default_factory=dict)
 
+    def snapshot(self) -> dict:
+        """The counters as one consistent set (taken under the lock add() holds)."""
+        with _STATS_LOCK:
+            return {k: getattr(self, k) for k in ("audio_seconds", "windows", "encode_s", "decode_s", "steps",
+                                                  "tokens", "wall_s", "batches")}
+
     def add(self, o: "Stats"):
-        for k in ("audio_seconds", "windows", "encode_s", "decode_s", "steps", "tokens", "wall_s", "batches"):
-            setattr(self, k, getattr(self, k) + getattr(o, k))
+        with _STATS_LOCK:
+            for k in ("audio_seconds", "windows", "encode_s", "decode_s", "steps", "tokens", "wall_s", "batches"):
+                setattr(self, k, getattr(self, k) + getattr(o, k))
 
 
 class _KV:
@@ -181,7 +191,7 @@ class Engine:
                  itn: bool = False, pnc: bool = False, graphs: str = "v2", encoder_graph: str = "auto",
                  kv_margin: int = 32, step_graph: str = "lean", decoder_precision: str | None = None,
                  cuda_opts: dict | None = None, decode_batch: int = 256, kv_budget_mb: float = 6144,
-                 gpu_mem_limit_mb: float | None = None, cut: str = "energy", cut_min_blank_ms: int = 240,
+                 gpu_mem_limit_mb: float | None = None, gpu_arena_shrink_every: int = 8, cut: str = "energy", cut_min_blank_ms: int = 240,
                  timestamps: str = "none", lookahead: int | None = None, endpoint_frames: int = 8,
                  max_segment_frames: int = 375, rebase_frames: int = 7500, dec_format: str | None = None,
                  stream_share=None, enc_share=None, full_encoder: bool = False, word_boost: bool = True,
@@ -256,12 +266,17 @@ class Engine:
         else:
             self.providers = ["CPUExecutionProvider"]
         self.want = self.providers[0][0] if isinstance(self.providers[0], tuple) else self.providers[0]
-        # GPU: give the encoder's arena memory back after each run. Encoder batches have many different padded
-        # shapes; with kSameAsRequested the arena otherwise fragments over a long run until a ~0.5-1 GB request no
-        # longer fits the encoder's share of --gpu-mem-limit-mb (measured: out of memory after ~30-40 calls of 64 at
-        # 16000 MB, fp32; none with this). Memory only: the numbers computed are the same.
-        self._enc_ro = None
-        if self.dev == "cuda":
+        # GPU: give the encoder's unused arena memory back every Nth run (--gpu-arena-shrink-every, default 8).
+        # Encoder batches have many different padded shapes; with kSameAsRequested the arena otherwise fragments over
+        # a long run until a ~0.5-1 GB request no longer fits the encoder's share of --gpu-mem-limit-mb (measured:
+        # out of memory after ~30-40 calls of 64 at 16000 MB fp32; none with N = 1, 4, 8 or 16). Memory only: the
+        # numbers computed are the same. Cost on a V100 at fp32: ~5.5% throughput at N = 1, ~1.5% at N = 8.
+        self._enc_ro, self._enc_calls = None, [0]   # [runs of this encoder session], shared with enc_share engines
+        n = 8 if gpu_arena_shrink_every is None else gpu_arena_shrink_every
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError(f"gpu_arena_shrink_every must be a whole number >= 0 (got {n!r})")
+        self.arena_shrink_every = n                  # 1 = every run, 0 = never
+        if self.dev == "cuda" and self.arena_shrink_every:
             self._enc_ro = ort.RunOptions()
             self._enc_ro.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
         self.threads, self.decode_threads, self.graph_opt = threads, decode_threads or threads, graph_opt
@@ -295,15 +310,17 @@ class Engine:
                     and getattr(sh, "graph_opt", None) == self.graph_opt
                     and _canon_providers(getattr(sh, "providers", [])) == _canon_providers(self.providers)
                     and getattr(sh, "gpu_mem_limit_mb", None) == self.gpu_mem_limit_mb
-                    and (encoder_graph == "auto" or encoder_graph == getattr(sh, "encoder_graph", None))):
+                    and (encoder_graph == "auto" or encoder_graph == getattr(sh, "encoder_graph", None))
+                    and getattr(sh, "arena_shrink_every", None) == self.arena_shrink_every):
                 raise ValueError("enc_share: the other engine must hold the full encoder of the same model package, "
                                  "precision, device and session settings (threads, graph_opt, provider options, "
-                                 "GPU memory cap, encoder graph)")
+                                 "GPU memory cap, encoder graph, arena shrink interval)")
             self.enc, self.encoder_graph, self.enc_shared = sh.enc, sh.encoder_graph, True
             # the decoder graphs are stateless sessions too (cross_kv, ctc_lp, gather, prefill / step): an engine that
             # shares the encoder also reuses every graph the donor already opened with the same settings (e.g. the
             # top-k graphs a greedy engine opened for word boost, for a beam engine); calls run under one lock
             self._sessions, self._sess_lock = sh._sessions, sh._sess_lock
+            self._enc_calls = sh._enc_calls          # "every Nth run of this encoder", whichever engine runs it
             cands = []
         for g in cands:                   # first graph that exists, loads and runs a probe batch
             role = f"{g}{'' if self.enc_full else '_ctc'}.{p}"
@@ -599,6 +616,15 @@ class Engine:
         name = self.spec.graphs.get(role)
         return isinstance(name, str) and os.path.isfile(os.path.join(self.model_dir, name))
 
+    def _enc_run(self, io):
+        """One encoder run; every arena_shrink_every-th run (GPU) also shrinks the encoder's arena afterwards."""
+        ro = None
+        if self._enc_ro is not None:
+            self._enc_calls[0] += 1                  # under self.lock, which sharing engines share
+            if self._enc_calls[0] % self.arena_shrink_every == 0:
+                ro = self._enc_ro
+        self.enc.run_with_iobinding(io, ro)
+
     def _session(self, role: str, threads: int | None):
         with self._sess_lock:             # one session per key, also when engines are built from several threads
             return self._session_locked(role, threads)
@@ -646,7 +672,7 @@ class Engine:
         io.bind_cpu_input("audio_lens", np.array([len(x)], np.int64))
         for o in self.enc.get_outputs():
             io.bind_output(o.name, "cpu")
-        self.enc.run_with_iobinding(io, self._enc_ro)
+        self._enc_run(io)
         names = [o.name for o in self.enc.get_outputs()]
         ctc = io.get_outputs()[names.index("ctc_ids")].numpy()[0]
         fr = audiolib.SR * self.spec.encoder.subsampling * self.spec.frontend.hop_length // audiolib.SR  # samples/frame
@@ -1068,7 +1094,7 @@ class Engine:
                 io.bind_output("enc", self.dev)   # and is dropped
             io.bind_output("enc_lens", "cpu")
             io.bind_output("ctc_ids", "cpu")
-            self.enc.run_with_iobinding(io, self._enc_ro)
+            self._enc_run(io)
             outs = io.get_outputs()
             elen, ctc = outs[-2].numpy(), outs[-1].numpy()
             st.encode_s += time.perf_counter() - t0
@@ -1079,7 +1105,7 @@ class Engine:
         io.bind_output("enc", self.dev)
         io.bind_output("enc_lens", "cpu")
         io.bind_output("ctc_ids", "cpu")
-        self.enc.run_with_iobinding(io, self._enc_ro)
+        self._enc_run(io)
         outs = io.get_outputs()
         enc, elen = outs[0], outs[1].numpy()
         st.encode_s += time.perf_counter() - t0
@@ -1123,7 +1149,7 @@ class Engine:
         io.bind_output("enc", "cpu")
         io.bind_output("enc_lens", "cpu")
         io.bind_output("ctc_ids", "cpu")
-        self.enc.run_with_iobinding(io, self._enc_ro)
+        self._enc_run(io)
         enc, elen, ctc = (o.numpy() for o in io.get_outputs())
         clen = np.array([len(_ctc_collapse(ctc[r, : int(elen[r])])) for r in range(B)])
         st.encode_s += time.perf_counter() - t0
@@ -1510,7 +1536,7 @@ class Engine:
         io.bind_output("enc", "cpu")
         io.bind_output("enc_lens", "cpu")
         io.bind_output("ctc_ids", "cpu")
-        self.enc.run_with_iobinding(io, self._enc_ro)
+        self._enc_run(io)
         outs = io.get_outputs()
         enc, elen, ctc = outs[0].numpy(), outs[1].numpy(), outs[2].numpy()
         st.encode_s += time.perf_counter() - t0

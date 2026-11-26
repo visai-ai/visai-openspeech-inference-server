@@ -24,6 +24,7 @@ import urllib.request
 ENGINE_KEYS = ["model", "device", "provider", "precision", "threads", "decode_threads", "mode", "decode", "beam",
                "batch_size", "max_batch_seconds", "decode_batch", "kv_budget_mb", "lang", "max_new_tokens",
                "max_seconds", "min_seconds", "len_alpha", "graph_opt", "encoder_graph", "itn", "pnc", "gpu_mem_limit_mb",
+               "gpu_arena_shrink_every",
                "timestamps", "lookahead", "endpoint_frames", "max_segment_frames", "word_boost"]
 EXTRA_KEYS = ("timed_segments", "token_times", "align_ok", "lookahead", "guards")   # keys present only when asked for
 STREAM_MODES = ("ctc-stream", "dec-stream")      # chunk-encoder modes: fp32, greedy, served from --stream-model
@@ -71,6 +72,10 @@ def engine_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--kv-budget-mb", type=float, help="cap on decoder KV buffers per decode batch")
     ap.add_argument("--gpu-mem-limit-mb", type=float, help="hard GPU memory cap: per-session arenas + KV buffers "
                     "(a batch that does not fit fails loudly instead of growing into other jobs' memory)")
+    ap.add_argument("--gpu-arena-shrink-every", type=_num(int, 0), metavar="N",
+                    help="GPU: every Nth encoder run hands the encoder's unused arena memory back (stops memory "
+                    "fragmenting into an out-of-memory error under --gpu-mem-limit-mb on long runs); 1 = every run "
+                    "(safest, ~5%% slower), 0 = never; default 8 (~1.5%%); env GPU_ARENA_SHRINK_EVERY")
     ap.add_argument("--encoder-graph", help="auto (per-architecture order) or one encoder graph of the package, e.g. "
                     "encoder5")
     ap.add_argument("--lang", help="language prompt (th, en, zh, ...); default automatic")
@@ -125,6 +130,7 @@ ENV_FLAGS = [
     (("serve",), "--precisions", "PRECISIONS", "value"),
     (("serve",), "--decodes", "DECODES", "value"),
     (("serve",), "--stats", "STATS", "bool"),
+    (("serve", "transcribe"), "--gpu-arena-shrink-every", "GPU_ARENA_SHRINK_EVERY", "value"),
     (("serve",), "--host", "HOST", "value"),
     (("serve",), "--port", "PORT", "value"),
     (("serve",), "--max-streams", "MAX_STREAMS", "value"),
@@ -339,7 +345,7 @@ def serve_facts(engines: dict, modes: list, cfg: dict, a) -> dict:
             "langs": served_langs(a, [lg for lg in V1_LANGS if f"<|{lg}|>" in ids], e0.lang),
             "defaults": {"lang": e0.lang, "itn": bool(e0.itn), "pnc": bool(e0.pnc),
                          "timestamps": {m: first[m].timestamps for m in modes}},
-            "timestamps_by_mode": tbm, "live": sl is not None,
+            "timestamps_by_mode": tbm, "live": sl is not None, "stats": bool(getattr(a, "stats", False)),
             "live_modes": [m for m in modes if m in STREAM_MODES],
             "max_stream_seconds": round(MAX_FRAMES / st.spec.frames_per_second) if st else None,
             "max_body_mb": a.max_body_mb, "max_audio_seconds": a.max_audio_s, "max_streams": a.max_streams,
@@ -647,26 +653,28 @@ def cmd_serve(a) -> None:
     queues = {k: queue.Queue() for k in engines}
     run_lock = threading.Lock()                    # one engine runs at a time: the thread budget is per server
     # --stats counters (GET /stats): micro-batches per engine and 503 answers; numbers only, never request content
-    counters = {"t0": time.time(), "batches": {}, "http_503": 0, "conn_limit_503": 0}
+    counters = {"t0": time.monotonic(), "batches": {}, "http_503": 0, "conn_limit_503": 0}
     counters_lock = threading.Lock()
 
     def stats_view() -> dict:
         """GET /stats: what each engine did and the limits it runs with (after the memory clamp); numbers only."""
         with counters_lock:
             mb = {k: tuple(v) for k, v in counters["batches"].items()}
-            out = {"uptime_s": round(time.time() - counters["t0"], 1), "http_503": counters["http_503"],
+            out = {"uptime_s": round(time.monotonic() - counters["t0"], 1), "http_503": counters["http_503"],
                    "conn_limit_503": counters["conn_limit_503"]}
         rows = []
         for (m, p), e in engines.items():
             st, (n, r) = getattr(e, "stats", None), mb.get((m, p), (0, 0))
+            off = m.split(":")[0] not in STREAM_MODES          # batch limits apply to the offline engines only
+            dec = m.split(":")[0] == "decoder"                 # KV budget and decode pooling: the decoder only
+            snap = st.snapshot() if st is not None else None
             rows.append({"mode": m.split(":")[0], "precision": p, "decode": getattr(e, "decode_kind", None),
-                         "max_batch_seconds": getattr(e, "max_batch_seconds", None),
-                         "kv_budget_mb": getattr(e, "kv_budget_mb", None),
-                         "decode_batch": getattr(e, "decode_batch", None),
+                         "max_batch_seconds": getattr(e, "max_batch_seconds", None) if off else None,
+                         "kv_budget_mb": getattr(e, "kv_budget_mb", None) if dec else None,
+                         "decode_batch": getattr(e, "decode_batch", None) if dec else None,
                          "micro_batches": n, "requests": r, "mean_micro_batch": round(r / n, 2) if n else None,
-                         "engine": {k: round(float(getattr(st, k)), 3) for k in
-                                    ("audio_seconds", "windows", "encode_s", "decode_s", "steps", "tokens", "wall_s",
-                                     "batches")} if st is not None else None})
+                         "engine": ({k: (int(v) if k in ("windows", "steps", "tokens", "batches") else round(float(v), 3))
+                                     for k, v in snap.items()} if snap is not None else None)})
         out["engines"] = rows
         return out
     streams = threading.BoundedSemaphore(a.max_streams)      # live sessions, server-wide (no per-IP limits: behind
@@ -698,13 +706,13 @@ def cmd_serve(a) -> None:
         eng, jobs = engines[m], queues[m]
 
         def run(batch):                            # decoded arrays (the handler decoded each upload once)
-            with counters_lock:
-                c = counters["batches"].setdefault(m, [0, 0])
-                c[0] += 1
-                c[1] += len(batch)
             with run_lock:
                 for j, r in zip(batch, eng.transcribe([j[0] for j in batch], options=[j[1] for j in batch])):
                     j[2].update({k: v for k, v in r.items() if k != "tokens"})
+            with counters_lock:                    # counted once it ran (a failed batch re-runs its jobs alone)
+                c = counters["batches"].setdefault(m, [0, 0])
+                c[0] += 1
+                c[1] += len(batch)
         while True:
             first = jobs.get()
             batch = [first]
@@ -796,7 +804,7 @@ def cmd_serve(a) -> None:
                     return self._send(404, {"error": "not found"})
                 if not self._auth():
                     return self._send(401, {"error": "unauthorized"})
-                return self._send(200, stats_view())
+                return self._send(200, stats_view(), extra={"Cache-Control": "no-store"})
             if u.path == "/help":                    # no auth, as /health: documentation and served facts only
                 qs = urllib.parse.parse_qs(u.query)
                 fmt = qs.get("format", ["markdown"])[0]

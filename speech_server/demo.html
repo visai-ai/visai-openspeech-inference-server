@@ -458,6 +458,7 @@ $("live").addEventListener("click", async () => {
     if (mode === "ctc-stream") start.ctc_beam = Number($("ctcBeam").value);
   }
   const setup = S.setup && S.setup.label + ", live";
+  S.liveGen = (S.liveGen || 0) + 1;
   const L = S.live = { opened: false, ready: false, tokens: [], t0: performance.now(), ws: null, mic: null, n: 0,
                        gotError: false };
   $("live").textContent = "Stop live"; $("live").classList.remove("secondary");
@@ -519,8 +520,10 @@ async function liveFailed(L) {                         // the handshake failed: 
   if (L.mic) { L.mic.stop(); L.mic = null; }
   if (S.live !== L) return;                            // a stale session: the current one keeps the page
   resetLive(); setStatus("");
+  const gen = S.liveGen;                               // a new session may start while the probe below runs
   let busy = false;
   try { busy = (await fetch("stream")).status === 503; } catch (e) { /* unreachable: treat as a proxy problem */ }
+  if (S.liveGen !== gen) return;
   if (busy) note($("liveNote"), "The server is busy with other live connections. Try again in a moment.", true);
   else note($("liveNote"), "Live mode unavailable through this proxy (the WebSocket connection failed). Upload and record still work.", true);
 }

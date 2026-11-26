@@ -86,7 +86,7 @@ PUBLIC_FACTS = ("modes", "default_mode", "precisions", "default_precision", "dec
                 "langs", "defaults", "timestamps_by_mode", "decode", "live", "live_modes", "max_stream_seconds",
                 "max_body_mb",
                 "max_audio_seconds", "max_streams", "live_idle_seconds", "live_first_audio_seconds",
-                "live_session_seconds", "word_boost_modes")
+                "live_session_seconds", "word_boost_modes", "stats")
 
 
 def _values(name: str, facts: dict, mode: str | None = None):
@@ -294,17 +294,22 @@ def help_json(facts: dict) -> dict:
         if k == "ctc_beam":
             p["modes"] = [m for m in d["modes"] if m in (facts.get("word_boost_modes") or [])]
         params[k] = p
-    return {
-        "server": {k: facts.get(k) for k in PUBLIC_FACTS},
-        "endpoints": {"POST /v1/transcribe": "audio file bytes in the body (WAV / FLAC / OGG / MP3; others need "
+    endpoints = {"POST /v1/transcribe": "audio file bytes in the body (WAV / FLAC / OGG / MP3; others need "
                                              "ffmpeg on the server), options as query parameters",
                       "GET /v1/check": "200 if the key is accepted (auth only)",
                       "GET /health": "server status (no auth)", "GET /help": "this documentation (markdown; "
                                                                             "?format=json for this form)",
                       "GET /demo": "browser demo page", "GET /stream": "WebSocket: live streaming (CTC, or the "
-                                                                       "streaming decoder preview; see docs)"},
+                                                                       "streaming decoder preview; see docs)"}
+    auth = "Authorization: Bearer <key> on POST /v1/transcribe, GET /v1/check and the /stream start message"
+    if facts.get("stats"):
+        endpoints["GET /stats"] = "serving counters for tuning; numbers only (API key required)"
+        auth = auth.replace(" and the /stream", ", GET /stats and the /stream")
+    return {
+        "server": {k: facts.get(k) for k in PUBLIC_FACTS},
+        "endpoints": endpoints,
         "query_params": params, "response_keys": dict(RESPONSE_KEYS),
-        "auth": "Authorization: Bearer <key> on POST /v1/transcribe, GET /v1/check and the /stream start message",
+        "auth": auth,
         "live_start": {"type": "start", "key": "<key, or the Authorization header>", "mode": facts.get("live_modes"),
                        "lookahead": "a look-ahead served for the mode (integer; server.lookaheads_by_mode)",
                        "lang / itn / pnc": "dec-stream only: the decoder prompt (auto or a served language; JSON "
@@ -382,6 +387,8 @@ def help_markdown(facts: dict) -> str:
     cap = (f"; ctc-stream / live CTC: at most {s.get('max_stream_seconds')} s per stream"
            if s.get("max_stream_seconds") is not None else "")
     lines.append(f"- upload limits: {s.get('max_body_mb')} MB, {s.get('max_audio_seconds')} s of audio{cap}")
+    if s.get("stats"):
+        lines.append("- `GET /stats` (needs the API key): serving counters for tuning; numbers only")
     if s.get("live"):
         lines.append(f"- live sessions: {s.get('max_streams')} at once; idle after {s.get('live_idle_seconds')} s "
                      f"without audio ({s.get('live_first_audio_seconds')} s for the first audio); at most "

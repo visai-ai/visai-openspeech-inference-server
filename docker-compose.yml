@@ -21,6 +21,7 @@ x-common: &common
     DECODE: ${DECODE:-}
     DECODES: ${DECODES:-}
     STATS: ${STATS:-}
+    GPU_ARENA_SHRINK_EVERY: ${GPU_ARENA_SHRINK_EVERY:-}
     BEAM: ${BEAM:-}
     PRECISION: ${PRECISION:-}
     PRECISIONS: ${PRECISIONS:-}
