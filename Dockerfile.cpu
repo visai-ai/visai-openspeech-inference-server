@@ -1,0 +1,32 @@
+# CPU image of the speech-to-text server. Build:   docker build -f Dockerfile.cpu -t speech-server:cpu .
+# Run (model from Hugging Face, see README.md):
+#   docker run --rm -p 127.0.0.1:8000:8000 -e SPEECH_API_KEY -e HF_TOKEN -e MODEL_REPO=<owner>/<name> \
+#       -v speech-models:/models speech-server:cpu
+FROM python:3.12-slim-bookworm
+
+# ffmpeg decodes M4A / MP4 / WebM / AAC / AMR uploads (WAV, FLAC, OGG and MP3 work without it): --build-arg WITH_FFMPEG=0
+# leaves it out for a smaller image.
+ARG WITH_FFMPEG=1
+RUN if [ "$WITH_FFMPEG" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
+WORKDIR /app
+COPY requirements-cpu.txt /app/
+RUN pip install -r /app/requirements-cpu.txt
+COPY speech_server /app/speech_server
+
+# unprivileged user; /models holds downloaded model repositories (mount a volume to keep them across restarts)
+RUN useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin speech \
+    && mkdir -p /models && chown speech /models
+USER speech
+# DEVICE=cpu is preset (the default is cuda); like any environment setting it outranks a --config file
+ENV DEVICE=cpu HOST=0.0.0.0 PORT=8000 MODEL_CACHE=/models HF_HOME=/models/.hf
+VOLUME ["/models"]
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+    CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8000'),timeout=4)" || exit 1
+ENTRYPOINT ["python", "-P", "-m", "speech_server"]
+CMD ["serve"]

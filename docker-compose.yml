@@ -1,0 +1,58 @@
+# docker compose --profile cpu up      (or --profile gpu; needs the NVIDIA Container Toolkit)
+# Configuration comes from the environment or a .env file next to this file (never commit it): SPEECH_API_KEY,
+# and MODEL_REPO + HF_TOKEN (automatic download, kept in the speech-models volume) or MODEL_DIR=/local-models/<dir>
+# (files you placed in ./models on the host, mounted read-only). The variables below are passed through (unset ones
+# keep the server's defaults); DEVICE, HOST, PORT and MODEL_CACHE are fixed by the images and this file.
+# The port is published on 127.0.0.1 only (BIND=0.0.0.0 to expose it): put a TLS reverse proxy in front for remote
+# clients, since the API key travels in a request header.
+x-common: &common
+  ports: ["${BIND:-127.0.0.1}:${PORT:-8000}:8000"]
+  environment:
+    SPEECH_API_KEY: ${SPEECH_API_KEY:?set SPEECH_API_KEY}
+    HF_TOKEN: ${HF_TOKEN:-}
+    MODEL_REPO: ${MODEL_REPO:-}
+    MODEL_REVISION: ${MODEL_REVISION:-}
+    MODEL_DIR: ${MODEL_DIR:-}
+    STREAM_MODEL_REPO: ${STREAM_MODEL_REPO:-}
+    STREAM_MODEL_REVISION: ${STREAM_MODEL_REVISION:-}
+    STREAM_MODEL_DIR: ${STREAM_MODEL_DIR:-}
+    MODE: ${MODE:-}
+    MODES: ${MODES:-}
+    DECODE: ${DECODE:-}
+    BEAM: ${BEAM:-}
+    PRECISION: ${PRECISION:-}
+    PRECISIONS: ${PRECISIONS:-}
+    THREADS: ${THREADS:-}
+    LANG_DEFAULT: ${LANG_DEFAULT:-}
+    MAX_STREAMS: ${MAX_STREAMS:-}
+    MODEL_NAME: ${MODEL_NAME:-}
+    SHARE_ENCODER: ${SHARE_ENCODER:-true}
+    WORD_BOOST: ${WORD_BOOST:-}
+  volumes:
+    - speech-models:/models
+    - ./models:/local-models:ro
+  read_only: true
+  tmpfs:
+    - /tmp:size=6g,noexec,nosuid,nodev   # upload spool (in RAM): larger than the server's --spool-max-mb (4096 MB)
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+  speech-cpu:
+    <<: *common
+    profiles: ["cpu"]
+    build: { context: ., dockerfile: Dockerfile.cpu }
+    image: speech-server:cpu
+  speech-gpu:
+    <<: *common
+    profiles: ["gpu"]
+    build: { context: ., dockerfile: Dockerfile.gpu }
+    image: speech-server:gpu
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+
+volumes:
+  speech-models:

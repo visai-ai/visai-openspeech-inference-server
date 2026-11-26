@@ -1,0 +1,24 @@
+# model files and audio never belong in this repository
+models/
+*.onnx
+*.onnx.data
+*.pt
+*.bin
+*.safetensors
+*.npy
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+# secrets
+.env*
+*.key
+api_key*
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speech-inference-server"
+version = "0.1.0"
+description = "ONNX Runtime speech-to-text inference server: HTTP file transcription and WebSocket live streaming, CPU or GPU"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3",
+    "sentencepiece>=0.2,<0.3",
+    "soundfile>=0.12",
+    "soxr>=0.3",
+    "huggingface_hub>=0.32,<2",
+]
+
+[project.optional-dependencies]
+cpu = ["onnxruntime>=1.20,<2"]
+gpu = ["onnxruntime-gpu>=1.20,<2"]
+
+[project.scripts]
+speech-server = "speech_server.cli:main"
+
+[tool.setuptools]
+packages = ["speech_server"]
+
+[tool.setuptools.package-data]
+speech_server = ["demo.html", "USAGE.md", "configs/*.json"]

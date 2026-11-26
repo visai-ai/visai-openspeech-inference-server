@@ -1,0 +1,9 @@
+{
+ "device": "cuda",
+ "precision": "fp16",
+ "mode": "ctc",
+ "batch_size": 64,
+ "max_batch_seconds": 600,
+ "encoder_graph": "auto",
+ "gpu_mem_limit_mb": 16000
+}

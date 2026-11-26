@@ -1,0 +1,13 @@
+{
+ "device": "cuda",
+ "precision": "fp16",
+ "mode": "decoder",
+ "decode": "greedy",
+ "batch_size": 64,
+ "max_batch_seconds": 600,
+ "decode_batch": 256,
+ "kv_budget_mb": 6144,
+ "encoder_graph": "auto",
+ "max_new_tokens": 448,
+ "gpu_mem_limit_mb": 16000
+}

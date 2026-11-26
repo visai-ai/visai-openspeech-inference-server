@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speech demo</title>
+<style>
+:root { --bg: #f6f7f9; --card: #ffffff; --fg: #1d2330; --muted: #5d6677; --line: #dde1e8; --accent: #2f5bd3;
+        --accent-fg: #ffffff; --warn-bg: #fff4e0; --warn-fg: #7a4b00; --err-bg: #fdecec; --err-fg: #8f1d1d;
+        --live: #c62828; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171d; --card: #1d2129; --fg: #e7eaf0; --muted: #9aa3b2; --line: #313745; --accent: #7a9bff;
+          --accent-fg: #0f1320; --warn-bg: #3a2c12; --warn-fg: #f3cf8b; --err-bg: #3b1c1c; --err-fg: #f4b4b4;
+          --live: #ff6b6b; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI",
+       Roboto, "Noto Sans Thai", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 1.3rem; margin: 4px 0 16px; }
+h2 { font-size: 1rem; margin: 0 0 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 4px; }
+input[type=password], input[type=file], select { width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+       border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .grid { grid-template-columns: 1fr; } }
+.check { display: flex; align-items: center; gap: 8px; color: var(--fg); font-size: .95rem; margin: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+button { padding: 9px 16px; border: 0; border-radius: 8px; background: var(--accent); color: var(--accent-fg);
+         font: inherit; font-weight: 600; cursor: pointer; }
+button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+.note { padding: 8px 12px; border-radius: 8px; background: var(--warn-bg); color: var(--warn-fg); font-size: .9rem;
+        margin-top: 12px; }
+.error { background: var(--err-bg); color: var(--err-fg); }
+.hidden { display: none !important; }
+.status { color: var(--muted); font-size: .9rem; margin-top: 8px; min-height: 1.5em; }
+.rec { color: var(--live); font-weight: 600; }
+.text { white-space: pre-wrap; font-size: 1.1rem; padding: 12px; border: 1px solid var(--line); border-radius: 8px;
+        min-height: 3em; overflow-wrap: anywhere; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 12px 0 0; font-size: .9rem; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; }
+.tablewrap { overflow-x: auto; margin-top: 12px; max-height: 360px; overflow-y: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td.t { white-space: normal; overflow-wrap: anywhere; }
+th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
+h3 { font-size: .9rem; margin: 16px 0 0; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Speech-to-text demo</h1>
+
+  <section class="card" id="gate">
+    <h2>Enter your API key</h2>
+    <label for="key">API key</label>
+    <input type="password" id="key" autocomplete="off" spellcheck="false">
+    <div class="row"><button id="unlock">Continue</button></div>
+    <div class="status" id="gateStatus"></div>
+  </section>
+
+  <div id="app" class="hidden">
+    <section class="card">
+      <h2>Settings</h2>
+      <div class="grid">
+        <div><label for="mode">Mode</label><select id="mode"></select></div>
+        <div><label for="lang">Language</label><select id="lang"></select></div>
+        <div><label for="timestamps">Timestamps</label><select id="timestamps"></select></div>
+        <div id="laBox"><label for="lookahead">Look-ahead (80 ms frames)</label><select id="lookahead"></select></div>
+        <div id="precBox"><label for="precision">Precision</label><select id="precision"></select></div>
+        <div id="formBox">
+          <label>Output form</label>
+          <label class="check"><input type="checkbox" id="itn"> Written numbers (ITN)</label>
+          <label class="check"><input type="checkbox" id="pnc"> Punctuation and case</label>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Audio</h2>
+      <label for="file">Upload a file</label>
+      <input type="file" id="file" accept="audio/*,video/*">
+      <div class="row">
+        <button id="sendFile">Transcribe file</button>
+        <button id="rec" class="secondary">Record</button>
+        <button id="live" class="secondary">Start live</button>
+      </div>
+      <div class="note hidden" id="micNote"></div>
+      <div class="note hidden" id="liveNote"></div>
+      <div class="status" id="status"></div>
+    </section>
+
+    <section class="card">
+      <h2>Result</h2>
+      <div class="text" id="out"></div>
+      <dl class="facts" id="facts"></dl>
+      <div id="tables"></div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const S = { key: null, help: null, busy: false, live: null, rec: null };
+
+function setStatus(msg, cls) { const e = $("status"); e.textContent = msg || ""; e.className = "status " + (cls || ""); }
+function show(el, on) { el.classList.toggle("hidden", !on); }
+function note(el, msg, err) { el.textContent = msg; el.classList.toggle("error", !!err); show(el, !!msg); }
+function auth() { return { "Authorization": "Bearer " + S.key }; }
+
+async function unlock(key) {
+  $("gateStatus").textContent = "Checking the key";
+  let r;
+  try { r = await fetch("v1/check", { headers: { "Authorization": "Bearer " + key } }); }
+  catch (e) { $("gateStatus").textContent = "The server could not be reached."; return; }
+  if (r.status !== 200) { $("gateStatus").textContent = "Key not accepted."; return; }
+  S.key = key;
+  try { sessionStorage.setItem("asr_demo_key", key); } catch (e) { /* storage off: memory only */ }
+  const h = await fetch("help?format=json");
+  S.help = await h.json();
+  show($("gate"), false); show($("app"), true);
+  setup();
+}
+
+function fill(sel, items, value) {
+  sel.innerHTML = "";
+  for (const it of items) {
+    const o = document.createElement("option");
+    o.value = it[0]; o.textContent = it[1]; sel.appendChild(o);
+  }
+  if (value !== undefined && items.some((it) => it[0] === value)) sel.value = value;
+}
+
+const MODE_NAMES = { "decoder": "Decoder (best accuracy)", "ctc": "CTC (fastest)", "ctc-stream": "CTC streaming",
+                     "dec-stream": "Decoder streaming (preview)" };
+const STREAMING = ["ctc-stream", "dec-stream"];
+function liveModes() { const s = S.help.server; return s.live_modes || (s.live ? ["ctc-stream"] : []); }
+const LANG_NAMES = { "auto": "Automatic" };
+function langName(code) {                              // every served language; the browser names it when it can
+  if (LANG_NAMES[code]) return LANG_NAMES[code];
+  try { const n = new Intl.DisplayNames([navigator.language || "en"], { type: "language" }).of(code);
+        if (n && n !== code) return n + " (" + code + ")"; } catch (e) { /* no Intl.DisplayNames */ }
+  return code;
+}
+
+function setup() {                                     // every choice and default comes from GET /help
+  const s = S.help.server, d = s.defaults || {};
+  fill($("mode"), s.modes.map((m) => [m, MODE_NAMES[m] || m]), s.default_mode);
+  const langs = ["auto"].concat(s.langs || []);
+  fill($("lang"), langs.map((l) => [l, langName(l)]), d.lang || "auto");
+  $("itn").checked = !!d.itn; $("pnc").checked = !!d.pnc;
+  fill($("lookahead"), (s.lookaheads || []).map((l) => [String(l), l + " (" + Math.round((l + 1) * 80) + " ms chunk)"]),
+       String(s.default_lookahead));
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    note($("micNote"), "The microphone needs a secure page (HTTPS, or http://localhost). File upload still works.");
+    $("rec").disabled = true; $("live").disabled = true;
+  }
+  if (!s.live) { show($("live"), false); }
+  $("mode").addEventListener("change", modeChanged);
+  $("timestamps").addEventListener("change", () => { S.tsTouched = true; });
+  $("lookahead").addEventListener("change", () => { S.laTouched = true; });
+  modeChanged();
+}
+
+const TS_NAMES = { "none": "None", "segment": "Per segment (decoder, experimental)", "token": "Per token (CTC times)" };
+
+function modeChanged() {
+  const s = S.help.server, m = $("mode").value, tq = S.help.query_params.timestamps;
+  const allowed = tq.values_by_mode[m] || ["none"];
+  const cur = $("timestamps").value;
+  fill($("timestamps"), allowed.map((t) => [t, TS_NAMES[t] || t]),
+       allowed.includes(cur) && S.tsTouched ? cur : (tq.default_by_mode[m] || "none"));
+  show($("laBox"), STREAMING.includes(m));
+  const lbm = s.lookaheads_by_mode || {}, dbm = s.default_lookahead_by_mode || {};
+  if (lbm[m]) {                                        // the look-aheads served for this mode (dec-stream may serve fewer)
+    const curLa = $("lookahead").value, las = lbm[m].map(String);
+    fill($("lookahead"), lbm[m].map((l) => [String(l), l + " (" + Math.round((l + 1) * 80) + " ms chunk)"]),
+         las.includes(curLa) && S.laTouched ? curLa : String(dbm[m]));
+  }
+  const precs = s.precisions[m] || [];
+  fill($("precision"), precs.map((p) => [p, p]), precs[0]);
+  show($("precBox"), precs.length > 1);
+  show($("formBox"), m === "decoder" || m === "dec-stream");
+  $("live").disabled = !s.live || !window.isSecureContext || !navigator.mediaDevices;
+}
+
+function query() {                                     // explicit values: what the page shows is what runs
+  const m = $("mode").value, q = new URLSearchParams();
+  q.set("mode", m);
+  q.set("precision", $("precision").value);
+  q.set("lang", $("lang").value);
+  if (m === "decoder" || m === "dec-stream") { q.set("itn", $("itn").checked ? "true" : "false"); q.set("pnc", $("pnc").checked ? "true" : "false"); }
+  q.set("timestamps", $("timestamps").value);
+  if (STREAMING.includes(m)) q.set("lookahead", $("lookahead").value);
+  return q.toString();
+}
+
+// ---------------------------------------------------------------- audio helpers (16 kHz mono PCM16 WAV in JS)
+async function resample(data, rate) {
+  if (rate === 16000) return data;
+  const n = Math.max(1, Math.ceil(data.length * 16000 / rate));
+  const ctx = new OfflineAudioContext(1, n, 16000);
+  const buf = ctx.createBuffer(1, data.length, rate);
+  buf.copyToChannel(data, 0);
+  const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start();
+  return (await ctx.startRendering()).getChannelData(0);
+}
+function mono(audioBuffer) {
+  const n = audioBuffer.length, c = audioBuffer.numberOfChannels, out = new Float32Array(n);
+  for (let k = 0; k < c; k++) { const d = audioBuffer.getChannelData(k); for (let i = 0; i < n; i++) out[i] += d[i] / c; }
+  return out;
+}
+function pcm16(f32) {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) { const v = Math.max(-1, Math.min(1, f32[i])); out[i] = v < 0 ? v * 32768 : v * 32767; }
+  return out;
+}
+function wav(f32) {
+  const pcm = pcm16(f32), b = new ArrayBuffer(44 + pcm.byteLength), v = new DataView(b);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + pcm.byteLength, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 16000, true);
+  v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data");
+  v.setUint32(40, pcm.byteLength, true); new Int16Array(b, 44).set(pcm);
+  return new Blob([b], { type: "audio/wav" });
+}
+
+// ---------------------------------------------------------------- file / recording -> POST
+async function post(body, label) {
+  if (S.busy) return;
+  S.busy = true; setStatus("Transcribing " + label);
+  const t0 = performance.now();
+  try {
+    const r = await fetch("v1/transcribe?" + query(), { method: "POST", headers: auth(), body: body });
+    const d = await r.json();
+    const wall = (performance.now() - t0) / 1000;
+    if (!r.ok) { setStatus("Error " + r.status + ": " + (d.detail || d.error), "error"); return; }
+    render(d, wall);
+    setStatus("Done");
+  } catch (e) { setStatus("Request failed: " + e.message, "error"); }
+  finally { S.busy = false; }
+}
+
+$("sendFile").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { setStatus("Choose a file first."); return; }
+  const ext = (f.name.split(".").pop() || "").toLowerCase();
+  if (["wav", "flac", "mp3", "ogg"].includes(ext)) return post(f, f.name);
+  try {                                                // other containers: decode here, send 16 kHz WAV
+    setStatus("Converting " + f.name + " in the browser");
+    const ctx = new AudioContext();
+    const ab = await ctx.decodeAudioData(await f.arrayBuffer());
+    ctx.close();
+    post(wav(await resample(mono(ab), ab.sampleRate)), f.name);
+  } catch (e) { setStatus("This browser could not decode the file; try WAV, FLAC, MP3 or OGG.", "error"); }
+});
+
+async function micSource(rate) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false,
+    noiseSuppression: false, autoGainControl: false } });
+  let ctx = null, src;
+  try { ctx = rate ? new AudioContext({ sampleRate: rate }) : new AudioContext(); src = ctx.createMediaStreamSource(stream); }
+  catch (e) {                                          // e.g. a browser that will not resample the mic: native rate
+    if (ctx) ctx.close();
+    ctx = new AudioContext(); src = ctx.createMediaStreamSource(stream);
+  }
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  src.connect(proc); proc.connect(ctx.destination);
+  const stop = () => { proc.disconnect(); src.disconnect(); stream.getTracks().forEach((t) => t.stop()); ctx.close(); };
+  return { ctx, proc, stop };
+}
+
+$("rec").addEventListener("click", async () => {
+  if (S.rec) {                                         // stop and send
+    const r = S.rec; S.rec = null; r.m.stop();
+    $("rec").textContent = "Record"; $("rec").classList.add("secondary");
+    const n = r.chunks.reduce((a, c) => a + c.length, 0), all = new Float32Array(n);
+    let o = 0; for (const c of r.chunks) { all.set(c, o); o += c.length; }
+    return post(wav(await resample(all, r.m.ctx.sampleRate)), "the recording");
+  }
+  try {
+    const m = await micSource(0);
+    const chunks = [];
+    m.proc.onaudioprocess = (ev) => chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0)));
+    S.rec = { m, chunks };
+    $("rec").textContent = "Stop and transcribe"; $("rec").classList.remove("secondary");
+    setStatus("Recording", "rec");
+  } catch (e) { note($("micNote"), "Microphone unavailable: " + e.message, true); }
+});
+
+// ---------------------------------------------------------------- live (WebSocket /stream: CTC or decoder streaming)
+function wsUrl() {
+  const u = new URL("stream", location.href);
+  u.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  u.search = ""; u.hash = "";
+  return u.toString();
+}
+
+function Resampler(from) {    // linear, no low-pass (fallback only: the 16 kHz AudioContext path resamples natively)
+  let pos = 1, prev = 0;                               // position in [previous block's last sample, this block]
+  const step = from / 16000;
+  return (x) => {
+    if (from === 16000) return x;
+    const out = [], at = (k) => (k === 0 ? prev : x[k - 1]);
+    while (pos <= x.length) {
+      const i = Math.floor(pos), f = pos - i;
+      out.push(f ? at(i) + (at(i + 1) - at(i)) * f : at(i));
+      pos += step;
+    }
+    pos -= x.length; prev = x[x.length - 1];
+    return Float32Array.from(out);
+  };
+}
+
+$("live").addEventListener("click", async () => {
+  if (S.live) { stopLive(); return; }
+  const lm = liveModes();
+  if (!lm.includes($("mode").value) && lm.length) $("mode").value = lm[0];
+  modeChanged();
+  const mode = $("mode").value;
+  note($("liveNote"), "");
+  const L = S.live = { opened: false, ready: false, tokens: [], t0: performance.now(), ws: null, mic: null, n: 0 };
+  $("live").textContent = "Stop live"; $("live").classList.remove("secondary");
+  $("out").textContent = ""; $("facts").innerHTML = ""; $("tables").innerHTML = "";
+  setStatus("Waiting for microphone permission");
+  try {                                                // the permission prompt comes first, before any socket
+    L.mic = await micSource(16000);
+  } catch (e) { note($("micNote"), "Microphone unavailable: " + e.message, true); resetLive(); setStatus(""); return; }
+  if (S.live !== L) { L.mic.stop(); return; }
+  const rs = Resampler(L.mic.ctx.sampleRate);
+  L.mic.proc.onaudioprocess = (e) => {                 // audio flows only once the server said ready
+    if (!L.ready || !L.ws || L.ws.readyState !== WebSocket.OPEN) return;
+    const x = rs(e.inputBuffer.getChannelData(0));
+    L.n += x.length; L.ws.send(pcm16(x).buffer);
+  };
+  let ws;
+  try { ws = new WebSocket(wsUrl()); } catch (e) { liveFailed(L); return; }
+  L.ws = ws; ws.binaryType = "arraybuffer";
+  setStatus("Connecting");
+  ws.onopen = () => {
+    L.opened = true;
+    const start = { type: "start", key: S.key, mode: mode, lookahead: Number($("lookahead").value) };
+    if (mode === "dec-stream") { start.lang = $("lang").value; start.itn = $("itn").checked; start.pnc = $("pnc").checked; }
+    ws.send(JSON.stringify(start));
+  };
+  ws.onerror = () => { if (!L.opened) liveFailed(L); };
+  ws.onclose = (ev) => {
+    if (L.mic) { L.mic.stop(); L.mic = null; }
+    if (ev.code === 1008 && L.opened) setStatus("The server refused the stream (key, options or pace).", "error");
+    if (S.live === L) resetLive();
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return;
+    const d = JSON.parse(ev.data);
+    if (d.type === "ready") {
+      L.ready = true;
+      setStatus("Live: speak now", "rec");
+    } else if (d.type === "partial") {
+      $("out").textContent = d.text;
+      L.tokens = L.tokens.concat(d.tokens);
+    } else if (d.type === "final") {
+      render({ text: d.text, audio_seconds: d.audio_seconds, token_times: d.token_times, mode: "live " + mode,
+               lookahead: Number($("lookahead").value), segments: d.segments, guards: d.guards },
+             (performance.now() - L.t0) / 1000);
+      const why = { limit: "Stopped: the stream reached the server's length limit.",
+                    idle: "Stopped: no audio reached the server for a while.",
+                    session_limit: "Stopped: the session reached the server's time limit." };
+      setStatus(why[d.reason] || "Done");
+    } else if (d.type === "error") {
+      setStatus(d.error === "busy" ? "All live sessions are in use. Try again in a moment." : "Server: " + d.error, "error");
+    }
+  };
+});
+
+async function liveFailed(L) {                         // the handshake failed: a busy server (503) or a proxy problem
+  if (L.mic) { L.mic.stop(); L.mic = null; }
+  resetLive(); setStatus("");
+  let busy = false;
+  try { busy = (await fetch("stream")).status === 503; } catch (e) { /* unreachable: treat as a proxy problem */ }
+  if (busy) note($("liveNote"), "The server is busy with other live connections. Try again in a moment.", true);
+  else note($("liveNote"), "Live mode unavailable through this proxy (the WebSocket connection failed). Upload and record still work.", true);
+}
+
+function stopLive() {
+  const L = S.live; if (!L) return;
+  if (L.mic) { L.mic.stop(); L.mic = null; }
+  if (L.ws && L.ws.readyState === WebSocket.OPEN) { L.ws.send(JSON.stringify({ type: "stop" })); setStatus("Finishing"); }
+  else { if (L.ws) L.ws.close(); resetLive(); }
+}
+function resetLive() { S.live = null; $("live").textContent = "Start live"; $("live").classList.add("secondary"); }
+
+// ---------------------------------------------------------------- output
+function fmt(x) { return x === null || x === undefined ? "n/a" : Number(x).toFixed(2); }
+function table(title, cols, rows) {
+  const h = document.createElement("h3"); h.textContent = title;
+  const wrap = document.createElement("div"); wrap.className = "tablewrap";
+  const t = document.createElement("table"), hr = document.createElement("tr");
+  for (const c of cols) { const th = document.createElement("th"); th.textContent = c[0]; hr.appendChild(th); }
+  t.appendChild(hr);
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    for (const c of cols) { const td = document.createElement("td"); const v = c[1](r); td.textContent = v;
+      if (c[2]) td.className = "t"; tr.appendChild(td); }
+    t.appendChild(tr);
+  }
+  wrap.appendChild(t);
+  $("tables").appendChild(h); $("tables").appendChild(wrap);
+}
+function fact(k, v) { const dt = document.createElement("dt"); dt.textContent = k; const dd = document.createElement("dd");
+  dd.textContent = v; $("facts").appendChild(dt); $("facts").appendChild(dd); }
+
+function render(d, wall) {
+  $("out").textContent = d.text || "(no speech recognised)";
+  $("facts").innerHTML = ""; $("tables").innerHTML = "";
+  fact("Audio length", fmt(d.audio_seconds) + " s");
+  fact("Wall time", fmt(wall) + " s");
+  if (d.seconds !== undefined) fact("Server time", fmt(d.seconds) + " s");
+  if (d.mode) fact("Mode", d.mode + (d.lookahead !== undefined ? ", look-ahead " + d.lookahead : ""));
+  if (d.align_ok === false) fact("Alignment", "failed for at least one window (times empty)");
+  if (d.guards) fact("Decoder guards", Object.keys(d.guards).map((k) => k + " " + d.guards[k]).join(", "));
+  if (d.segments && d.segments.length)
+    table("Segments", [["Start", (r) => fmt(r.start)], ["End", (r) => fmt(r.end)], ["Text", (r) => r.text, true]]
+      .concat(d.segments.some((r) => r.reason) ? [["Ended by", (r) => r.reason || ""]] : []), d.segments);
+  if (d.timed_segments)
+    table("Timed segments (decoder timestamps)", [["Start", (r) => fmt(r.start)], ["End", (r) => fmt(r.end)],
+      ["Text", (r) => r.text, true], ["Flag", (r) => r.flag || ""]], d.timed_segments);
+  if (d.token_times) {
+    const cols = [["Token", (r) => r.text, true], ["Start", (r) => fmt(r.start)], ["End", (r) => fmt(r.end)]];
+    if (d.token_times.some((r) => r.emit !== undefined)) cols.push(["Emitted", (r) => fmt(r.emit)]);
+    if (d.token_times.some((r) => r.aligned === false)) cols.push(["Aligned", (r) => (r.aligned ? "yes" : "no")]);
+    table("Token times (seconds)", cols, d.token_times);
+  }
+}
+
+$("unlock").addEventListener("click", () => unlock($("key").value.trim()));
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") unlock($("key").value.trim()); });
+try { const k = sessionStorage.getItem("asr_demo_key"); if (k) unlock(k); } catch (e) { /* no storage */ }
+</script>
+</body>
+</html>

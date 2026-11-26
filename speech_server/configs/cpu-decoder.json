@@ -1,0 +1,12 @@
+{
+ "device": "cpu",
+ "precision": "fp32",
+ "mode": "decoder",
+ "decode": "greedy",
+ "threads": 16,
+ "batch_size": 16,
+ "max_batch_seconds": 240,
+ "decode_batch": 64,
+ "encoder_graph": "auto",
+ "max_new_tokens": 448
+}

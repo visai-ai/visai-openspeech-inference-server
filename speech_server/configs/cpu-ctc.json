@@ -1,0 +1,9 @@
+{
+ "device": "cpu",
+ "precision": "fp32",
+ "mode": "ctc",
+ "threads": 16,
+ "batch_size": 16,
+ "max_batch_seconds": 240,
+ "encoder_graph": "auto"
+}
