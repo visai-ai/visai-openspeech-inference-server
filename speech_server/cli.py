@@ -123,6 +123,7 @@ ENV_FLAGS = [
     (("serve",), "--stream-model-revision", "STREAM_MODEL_REVISION", "value"),
     (("serve",), "--modes", "MODES", "value"),
     (("serve",), "--precisions", "PRECISIONS", "value"),
+    (("serve",), "--decodes", "DECODES", "value"),
     (("serve",), "--host", "HOST", "value"),
     (("serve",), "--port", "PORT", "value"),
     (("serve",), "--max-streams", "MAX_STREAMS", "value"),
@@ -146,7 +147,8 @@ def env_argv(argv: list) -> list:
             continue
         names = [flag] + (["--no-" + flag[2:]] if kind == "bool" else [])
         names += {"--mode": ["--modes"], "--modes": ["--mode"], "--precision": ["--precisions"],
-                  "--precisions": ["--precision"]}.get(flag, [])    # one setting, two spellings: the CLI's wins
+                  "--precisions": ["--precision"], "--decode": ["--decodes"],
+                  "--decodes": ["--decode"]}.get(flag, [])    # one setting, two spellings: the CLI's wins
         if any(x == n or x.startswith(n + "=") for x in argv for n in names):
             continue
         v = v.strip()
@@ -249,7 +251,7 @@ def cmd_transcribe(a) -> None:
         key = read_key(a.api_key_env, a.api_key_file)
         for p in files:
             qd = {k: v for k, v in (("lang", a.lang), ("mode", a.mode), ("timestamps", a.timestamps),
-                                    ("precision", a.precision)) if v}
+                                    ("precision", a.precision), ("decode", a.decode)) if v}
             qd.update({k: "true" for k in ("itn", "pnc") if getattr(a, k)})
             if a.lookahead is not None:
                 qd["lookahead"] = str(a.lookahead)
@@ -308,8 +310,12 @@ def serve_facts(engines: dict, modes: list, cfg: dict, a) -> dict:
     from speech_server.stream import MAX_FRAMES
     precs = {}
     for m, p in engines:
-        precs.setdefault(m, []).append(p)
+        if ":" not in m:                           # "decoder:beam" etc.: extra decode kinds of a mode, not modes
+            precs.setdefault(m, []).append(p)
     first = {m: engines[(m, precs[m][0])] for m in modes}
+    decodes = ([first["decoder"].decode_kind] + [m.split(":", 1)[1] for m, p in engines
+                                                 if m.startswith("decoder:") and p == precs["decoder"][0]]
+               if "decoder" in modes else [])
     st = engines.get(("ctc-stream", "fp32"))
     sd = engines.get(("dec-stream", "fp32"))
     sl = st or sd                                  # look-aheads: the streaming engines share one export's chunks
@@ -320,7 +326,8 @@ def serve_facts(engines: dict, modes: list, cfg: dict, a) -> dict:
         tbm["decoder"] = ["none", "segment"]          # no ctc_lp graph in this export: token times not offered
     e0 = next(iter(first.values()))
     return {"modes": list(modes), "default_mode": modes[0], "precisions": {m: precs[m] for m in modes},
-            "default_precision": precs[modes[0]][0], "decode": first[modes[0]].decode_kind,
+            "default_precision": precs[modes[0]][0], "decode": decodes[0] if decodes else first[modes[0]].decode_kind,
+            "decodes": decodes, "default_decode": decodes[0] if decodes else None,
             "lookaheads": list(sl.lookaheads) if sl is not None else [],
             "default_lookahead": sl.lookahead if sl is not None else None,
             # per streaming mode (dec-stream may serve fewer look-aheads than ctc-stream: spec stream_dec.lookaheads)
@@ -338,18 +345,21 @@ def serve_facts(engines: dict, modes: list, cfg: dict, a) -> dict:
             "live_idle_seconds": a.ws_idle_s, "live_first_audio_seconds": a.ws_first_audio_s,
             "live_session_seconds": a.ws_session_max_s,
             "word_boost_modes": [m for m in modes if all(getattr(e, "_boost_why", "x") is None
-                                                          for (mm, _), e in engines.items() if mm == m)]}
+                                                          for (mm, _), e in engines.items()
+                                                          if mm.split(":")[0] == m)]}
 
 
 def build_engines(cfg: dict, modes: list, precs: list, stream_model: str | None, stream_threads: int,
-                  stream_precision: str = "fp32", share_encoder: bool = True) -> dict:
+                  stream_precision: str = "fp32", share_encoder: bool = True, decodes: list | None = None) -> dict:
     """{(mode, precision): Engine}. The server's --lang / --itn / --pnc / --timestamps / --lookahead are the engines'
     defaults (segment timestamps only for decoder; lookahead only for ctc-stream). ctc-stream: on --stream-model (or
     --model if it is a streaming package), with its own small intra-op thread count, and fp32 only (the only chunk
     graphs there are): any other precision asked for it is refused here, never silently replaced.
     share_encoder (default): decoder and ctc at one precision use one encoder session (the full graph; one copy of
     the encoder weights), and ctc-stream / dec-stream share their chunk-encoder sessions; False: every engine loads
-    its own (ctc then uses the CTC-only encoder graph)."""
+    its own (ctc then uses the CTC-only encoder graph).
+    decodes: the decoder's search kinds served per request (?decode=), the first being cfg's default; each further
+    kind is one more decoder engine, keyed ("decoder:<kind>", precision), sharing the default one's encoder."""
     explicit = set(cfg.get("_explicit", []))
     for sm in [m for m in modes if m in STREAM_MODES]:
         if stream_precision != "fp32":
@@ -390,8 +400,12 @@ def build_engines(cfg: dict, modes: list, precs: list, stream_model: str | None,
                 if both:
                     extra["enc_share"] = engines[("decoder", p)]
             engines[(m, p)] = make_engine(kw, **extra)
+            if m == "decoder":
+                for d in (decodes or [])[1:]:     # more search kinds: one engine each, sharing the encoder
+                    engines[(f"decoder:{d}", p)] = make_engine(
+                        {**kw, "decode": d}, **({"enc_share": engines[(m, p)]} if share_encoder else {}))
     # the dict's order is the request-default order of the caller's modes
-    return {k: engines[k] for m in modes for k in list(engines) if k[0] == m}
+    return {k: engines[k] for m in modes for k in list(engines) if k[0].split(":")[0] == m}
 
 
 def _decode_timer(seconds, fn):
@@ -592,6 +606,20 @@ def cmd_serve(a) -> None:
         sys.exit("--modes takes decoder, ctc, ctc-stream and/or dec-stream")
     if a.stream_model and "ctc-stream" not in modes:
         modes.append("ctc-stream")
+    # command line / env first (--decodes, or --decode alone), then --config's decodes, then the config's decode
+    raw_dec = a.decodes or (None if getattr(a, "decode", None) else cfg.get("decodes"))
+    if isinstance(raw_dec, (list, tuple)):
+        raw_dec = ",".join(str(x) for x in raw_dec)
+    if raw_dec is not None and not isinstance(raw_dec, str):
+        sys.exit("decodes must be a comma list (or a JSON list) of greedy / beam")
+    decodes = list(dict.fromkeys(d.strip() for d in (raw_dec or cfg["decode"]).split(",") if d.strip()))
+    if not decodes or any(d not in ("greedy", "beam") for d in decodes):
+        sys.exit("--decodes takes greedy and/or beam")
+    if raw_dec and "decoder" not in modes and decodes != ["greedy"]:
+        sys.exit("--decodes lists decoder search kinds; serve mode decoder too (--modes)")
+    cfg["decode"] = decodes[0]                     # the default; ?decode= picks among them per request
+    if len(decodes) > 1:
+        cfg["_explicit"] = sorted(set(cfg.get("_explicit", [])) | {"decode"})
     precs = list(dict.fromkeys(p.strip() for p in (a.precisions or cfg["precision"]).split(",") if p.strip()))
     if not precs or any(p not in ("fp32", "fp16", "int8") for p in precs):
         sys.exit("--precisions takes fp32, fp16 and/or int8")
@@ -602,7 +630,7 @@ def cmd_serve(a) -> None:
     # where the mode has them; lookahead only for ctc-stream).
     try:
         engines = build_engines(cfg, modes, precs, a.stream_model, a.stream_threads, a.stream_precision,
-                                share_encoder=a.share_encoder)
+                                share_encoder=a.share_encoder, decodes=decodes)
     except ValueError as e:
         sys.exit(f"serve: {e}")
     try:
@@ -725,7 +753,8 @@ def cmd_serve(a) -> None:
                                         "model": a.model_name or "model",
                                         "share_encoder": bool(a.share_encoder),
                                         "live": facts["live"],
-                                        "engines": [{"mode": m, "precision": p, "decode": e.decode_kind}
+                                        "decodes": facts["decodes"],
+                                        "engines": [{"mode": m.split(":")[0], "precision": p, "decode": e.decode_kind}
                                                     for (m, p), e in engines.items()]})
             if u.path == "/help":                    # no auth, as /health: documentation and served facts only
                 qs = urllib.parse.parse_qs(u.query)
@@ -1000,12 +1029,14 @@ def cmd_serve(a) -> None:
             except OSError:
                 pass
 
-        def _finish_post(self, mode, prec, slot, t0):
+        def _finish_post(self, ekey, slot, t0):
             if "error" in slot:
                 err = {"error": slot["error"], **({"detail": slot["detail"]} if "detail" in slot else {})}
                 return self._send(400 if slot["error"] in ("InputError", "ValueError", "LibsndfileError") else 500,
                                   err)
-            self._send(200, {"mode": mode, "precision": prec, "text": slot["text"], "windows": slot["windows"],
+            mode, prec = ekey[0].split(":")[0], ekey[1]
+            dec = {"decode": engines[ekey].decode_kind} if mode == "decoder" else {}
+            self._send(200, {"mode": mode, "precision": prec, **dec, "text": slot["text"], "windows": slot["windows"],
                              "segments": slot["segments"], "audio_seconds": slot["duration"],
                              "seconds": round(time.time() - t0, 3), **{k: slot[k] for k in EXTRA_KEYS if k in slot}})
 
@@ -1020,7 +1051,10 @@ def cmd_serve(a) -> None:
             # the query is validated before any of the body is read: a bad request costs no upload
             try:                                      # one definition (usage.py) for validation and the docs
                 mode, prec, opts = usage.parse_query(urllib.parse.parse_qs(u.query, keep_blank_values=True), facts)
-                engines[(mode, prec)].options(0, None, opts)
+                dec = opts.pop("decode", None)    # the decoder's search kind picks the engine, not an engine option
+                ekey = (f"decoder:{dec}" if mode == "decoder" and dec and dec != facts["default_decode"] else mode,
+                        prec)
+                engines[ekey].options(0, None, opts)
             except (ValueError, InputError) as e:
                 self.close_connection = True
                 self._send(400, {"error": str(e)} if not isinstance(e, InputError) else
@@ -1057,10 +1091,10 @@ def cmd_serve(a) -> None:
                     spooled[0] = 0
                 try:
                     slot, ev = {"duration": round(len(x) / 16000, 3)}, threading.Event()
-                    queues[(mode, prec)].put([x, opts, slot, ev])
+                    queues[ekey].put([x, opts, slot, ev])
                     del x
                     ev.wait()
-                    self._finish_post(mode, prec, slot, t0)
+                    self._finish_post(ekey, slot, t0)
                 finally:
                     budget.give(held)                 # after the response is sent (or failed to send)
             except OverflowError:
@@ -1226,6 +1260,9 @@ def main(argv=None) -> None:
     s.add_argument("--modes", help="comma list served on one port, chosen per request with ?mode= (first is the "
                    "default), e.g. decoder,ctc (ctc-stream / dec-stream: on --stream-model, else --model must be a "
                    "streaming package); default: --mode")
+    s.add_argument("--decodes", help="decoder search kinds served on one port, chosen per request with ?decode= (first "
+                   "is the default), e.g. greedy,beam: Normal and Performance mode side by side (one more decoder "
+                   "engine, sharing the encoder); default: --decode; env DECODES")
     s.add_argument("--precisions", help="comma list served on one port, chosen per request with ?precision= (first is "
                    "the default), e.g. fp32,fp16; default: --precision")
     s.add_argument("--tmp-dir", default=None, help="where uploads are spooled while transcribing (default: system tmp)")

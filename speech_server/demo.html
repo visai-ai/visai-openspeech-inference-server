@@ -48,6 +48,23 @@ th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line
 td.t { white-space: normal; overflow-wrap: anywhere; }
 th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
 h3 { font-size: .9rem; margin: 16px 0 0; color: var(--muted); }
+.setup { display: grid; grid-template-columns: minmax(7.5em, max-content) 1fr 1fr; gap: 6px; align-items: stretch; }
+.setup .head { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 2px 4px; }
+.setup .rowname { display: flex; flex-direction: column; justify-content: center; padding: 4px; }
+.setup .rowname b { font-size: .95rem; }
+.setup .rowname span { font-size: .8rem; color: var(--muted); }
+.cell { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 8px 10px; border: 1px solid var(--line);
+        border-radius: 8px; color: var(--fg); font-size: .9rem; cursor: pointer; }
+.cell input { margin-top: 3px; }
+.cell small { display: block; color: var(--muted); font-size: .78rem; }
+.cell.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.cell.off { opacity: .5; cursor: not-allowed; }
+@media (max-width: 520px) { .setup { grid-template-columns: 1fr 1fr; } .setup .corner { display: none; }
+  .setup .rowname { grid-column: 1 / -1; padding-top: 10px; } }
+textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card);
+           color: var(--fg); font: inherit; resize: vertical; }
+input[type=range] { width: 100%; }
+.hint { color: var(--muted); font-size: .85rem; margin: 8px 0 0; }
 </style>
 </head>
 <body>
@@ -64,9 +81,15 @@ h3 { font-size: .9rem; margin: 16px 0 0; color: var(--muted); }
 
   <div id="app" class="hidden">
     <section class="card">
+      <h2>Setup</h2>
+      <div class="setup" id="setup" role="radiogroup" aria-label="Setup"></div>
+      <p class="hint" id="setupHint"></p>
+    </section>
+
+    <section class="card">
       <h2>Settings</h2>
       <div class="grid">
-        <div><label for="mode">Mode</label><select id="mode"></select></div>
+        <div class="hidden"><label for="mode">Mode</label><select id="mode"></select></div>
         <div><label for="lang">Language</label><select id="lang"></select></div>
         <div><label for="timestamps">Timestamps</label><select id="timestamps"></select></div>
         <div id="laBox"><label for="lookahead">Look-ahead (80 ms frames)</label><select id="lookahead"></select></div>
@@ -76,6 +99,18 @@ h3 { font-size: .9rem; margin: 16px 0 0; color: var(--muted); }
           <label class="check"><input type="checkbox" id="itn"> Written numbers (ITN)</label>
           <label class="check"><input type="checkbox" id="pnc"> Punctuation and case</label>
         </div>
+      </div>
+      <div id="boostBox" class="hidden">
+        <h3>Word boost</h3>
+        <label for="boostList">Phrases to spell this way (one per line: names, organisations, terms)</label>
+        <textarea id="boostList" rows="3" spellcheck="false" placeholder="Acme Corp"></textarea>
+        <div class="grid">
+          <div><label for="boostScale">Strength: <span id="boostScaleVal">1.0</span></label>
+            <input type="range" id="boostScale" min="0.1" max="2" step="0.1" value="1"></div>
+          <div id="ctcBeamBox"><label for="ctcBeam">CTC beam width (with phrases)</label><select id="ctcBeam"></select></div>
+        </div>
+        <p class="hint">Higher strength finds more of the phrases and also writes them where they were not said. Keep
+          the list short: the words the model gets wrong.</p>
       </div>
     </section>
 
@@ -134,8 +169,18 @@ function fill(sel, items, value) {
   if (value !== undefined && items.some((it) => it[0] === value)) sel.value = value;
 }
 
-const MODE_NAMES = { "decoder": "Decoder (best accuracy)", "ctc": "CTC (fastest)", "ctc-stream": "CTC streaming",
+const MODE_NAMES = { "decoder": "Decoder", "ctc": "CTC", "ctc-stream": "CTC streaming",
                      "dec-stream": "Decoder streaming (preview)" };
+// the deployment setups: rows (speed vs accuracy) x columns (offline vs streaming); each cell is a mode (+ search)
+const ROWS = [
+  { id: "flash", name: "Flash", what: "CTC, fastest, never loops",
+    offline: { mode: "ctc" }, streaming: { mode: "ctc-stream" } },
+  { id: "normal", name: "Normal", what: "decoder, greedy",
+    offline: { mode: "decoder", decode: "greedy" }, streaming: { mode: "dec-stream", preview: true } },
+  { id: "performance", name: "Performance", what: "decoder, beam search, most accurate",
+    offline: { mode: "decoder", decode: "beam" }, streaming: null },
+];
+const COLS = [["offline", "Offline", "file or recording"], ["streaming", "Streaming", "live microphone, or a file streamed"]];
 const STREAMING = ["ctc-stream", "dec-stream"];
 function liveModes() { const s = S.help.server; return s.live_modes || (s.live ? ["ctc-stream"] : []); }
 const LANG_NAMES = { "auto": "Automatic" };
@@ -146,9 +191,59 @@ function langName(code) {                              // every served language;
   return code;
 }
 
+function cellState(cell) {                             // [available, reason] for one setup cell on this server
+  const s = S.help.server;
+  if (!cell) return [false, "no streaming beam search"];
+  if (!s.modes.includes(cell.mode)) return [false, "not served here"];
+  if (cell.decode && !(s.decodes || []).includes(cell.decode)) return [false, "not served here"];
+  return [true, ""];
+}
+
+function buildSetup() {
+  const box = $("setup"); box.innerHTML = "";
+  const corner = document.createElement("div"); corner.className = "head corner"; box.appendChild(corner);
+  for (const c of COLS) { const h = document.createElement("div"); h.className = "head"; h.textContent = c[1]; box.appendChild(h); }
+  let pick = null;
+  for (const row of ROWS) {
+    const rn = document.createElement("div"); rn.className = "rowname";
+    const b = document.createElement("b"); b.textContent = row.name;
+    const sp = document.createElement("span"); sp.textContent = row.what;
+    rn.appendChild(b); rn.appendChild(sp); box.appendChild(rn);
+    for (const c of COLS) {
+      const cell = row[c[0]], [ok, why] = cellState(cell);
+      const lab = document.createElement("label"); lab.className = "cell" + (ok ? "" : " off");
+      const inp = document.createElement("input"); inp.type = "radio"; inp.name = "setup";
+      inp.value = row.id + "|" + c[0]; inp.disabled = !ok;
+      const txt = document.createElement("div");
+      txt.textContent = row.name + ", " + c[1].toLowerCase();
+      const sm = document.createElement("small");
+      sm.textContent = ok ? (cell.preview ? "preview" : c[2]) : why;
+      txt.appendChild(sm); lab.appendChild(inp); lab.appendChild(txt); box.appendChild(lab);
+      if (ok) {
+        inp.addEventListener("change", () => selectSetup(row, c, cell));
+        const s = S.help.server;
+        const isDefault = cell.mode === s.default_mode && (!cell.decode || cell.decode === s.default_decode);
+        if (!pick || (isDefault && !pick.isDefault)) pick = { row, c, cell, inp, isDefault };
+      }
+    }
+  }
+  if (pick) { pick.inp.checked = true; selectSetup(pick.row, pick.c, pick.cell); }
+}
+
+function selectSetup(row, col, cell) {
+  if (S.live) stopLive();                              // a new setup ends the running live session first
+  S.setup = { label: row.name + " (" + row.what + "), " + col[1].toLowerCase(), cell: cell, streaming: col[0] === "streaming" };
+  S.decode = cell.decode || null;
+  for (const el of document.querySelectorAll(".cell")) el.classList.toggle("on", el.querySelector("input").checked);
+  $("mode").value = cell.mode;
+  modeChanged();
+}
+
 function setup() {                                     // every choice and default comes from GET /help
   const s = S.help.server, d = s.defaults || {};
   fill($("mode"), s.modes.map((m) => [m, MODE_NAMES[m] || m]), s.default_mode);
+  fill($("ctcBeam"), [1, 2, 3, 4, 5, 6, 7, 8].map((b) => [String(b), b === 1 ? "1 (greedy re-ranking)" : String(b)]), "4");
+  $("boostScale").addEventListener("input", () => { $("boostScaleVal").textContent = Number($("boostScale").value).toFixed(1); });
   const langs = ["auto"].concat(s.langs || []);
   fill($("lang"), langs.map((l) => [l, langName(l)]), d.lang || "auto");
   $("itn").checked = !!d.itn; $("pnc").checked = !!d.pnc;
@@ -159,10 +254,9 @@ function setup() {                                     // every choice and defau
     $("rec").disabled = true; $("live").disabled = true;
   }
   if (!s.live) { show($("live"), false); }
-  $("mode").addEventListener("change", modeChanged);
   $("timestamps").addEventListener("change", () => { S.tsTouched = true; });
   $("lookahead").addEventListener("change", () => { S.laTouched = true; });
-  modeChanged();
+  buildSetup();
 }
 
 const TS_NAMES = { "none": "None", "segment": "Per segment (decoder, experimental)", "token": "Per token (CTC times)" };
@@ -184,12 +278,39 @@ function modeChanged() {
   fill($("precision"), precs.map((p) => [p, p]), precs[0]);
   show($("precBox"), precs.length > 1);
   show($("formBox"), m === "decoder" || m === "dec-stream");
-  $("live").disabled = !s.live || !window.isSecureContext || !navigator.mediaDevices;
+  const wb = (s.word_boost_modes || []).includes(m);
+  show($("boostBox"), wb);
+  show($("ctcBeamBox"), m === "ctc" || m === "ctc-stream");
+  syncLive();
+  $("setupHint").textContent = S.setup ? (S.setup.streaming
+    ? "Streaming: Start live for the microphone, or upload / record to run the file through the streaming model."
+    : "Offline: upload a file or record, then transcribe. Choose a streaming setup for live transcription.") : "";
+}
+
+function boostList(live) {                             // the phrase list, or null; throws a message for a bad list
+  const m = $("mode").value;
+  if (!(S.help.server.word_boost_modes || []).includes(m)) return null;
+  const items = $("boostList").value.split("\n").map((x) => x.trim()).filter((x) => x);
+  if (!items.length) return null;
+  const max = live ? 100 : 500;
+  if (items.length > max) throw new Error("Word boost takes at most " + max + " phrases" + (live ? " on a live stream" : ""));
+  const long = items.find((x) => [...x].length > 50);
+  if (long) throw new Error("Each phrase may have at most 50 characters");
+  return items;
 }
 
 function query() {                                     // explicit values: what the page shows is what runs
   const m = $("mode").value, q = new URLSearchParams();
   q.set("mode", m);
+  if (m === "decoder" && S.decode && (S.help.server.decodes || []).length > 1) q.set("decode", S.decode);
+  const wb = boostList(false);
+  if (wb) {
+    q.set("word_boost", JSON.stringify(wb));
+    q.set("boost", $("boostScale").value);
+    if (m === "ctc" || m === "ctc-stream") q.set("ctc_beam", $("ctcBeam").value);
+    if (q.toString().length > 60000)                  // the list travels in the URL (the server takes up to 64 KB)
+      throw new Error("The phrase list is too long to send (Thai and Chinese text takes more room): shorten it");
+  }
   q.set("precision", $("precision").value);
   q.set("lang", $("lang").value);
   if (m === "decoder" || m === "dec-stream") { q.set("itn", $("itn").checked ? "true" : "false"); q.set("pnc", $("pnc").checked ? "true" : "false"); }
@@ -231,14 +352,21 @@ function wav(f32) {
 // ---------------------------------------------------------------- file / recording -> POST
 async function post(body, label) {
   if (S.busy) return;
+  let qs;
+  try { qs = query(); } catch (e) { setStatus(e.message, "error"); return; }
   S.busy = true; setStatus("Transcribing " + label);
+  const setup = S.setup && S.setup.label;            // as sent: the grid may change while the request runs
   const t0 = performance.now();
   try {
-    const r = await fetch("v1/transcribe?" + query(), { method: "POST", headers: auth(), body: body });
-    const d = await r.json();
+    const r = await fetch("v1/transcribe?" + qs, { method: "POST", headers: auth(), body: body });
+    const d = await r.json().catch(() => ({}));       // a proxy or the HTTP layer may answer in HTML or with no body
     const wall = (performance.now() - t0) / 1000;
-    if (!r.ok) { setStatus("Error " + r.status + ": " + (d.detail || d.error), "error"); return; }
-    render(d, wall);
+    if (!r.ok) {
+      const why = d.detail || d.error || (r.status === 414 ? "the request is too long (shorten the phrase list)"
+                                                           : r.statusText || "no details");
+      setStatus("Error " + r.status + ": " + why, "error"); return;
+    }
+    render(Object.assign({ setup: setup }, d), wall);
     setStatus("Done");
   } catch (e) { setStatus("Request failed: " + e.message, "error"); }
   finally { S.busy = false; }
@@ -317,12 +445,21 @@ function Resampler(from) {    // linear, no low-pass (fallback only: the 16 kHz 
 
 $("live").addEventListener("click", async () => {
   if (S.live) { stopLive(); return; }
-  const lm = liveModes();
-  if (!lm.includes($("mode").value) && lm.length) $("mode").value = lm[0];
-  modeChanged();
   const mode = $("mode").value;
+  if (!liveModes().includes(mode)) { setStatus("Choose a streaming setup for live transcription."); return; }
+  let wbLive;
+  try { wbLive = boostList(true); } catch (e) { setStatus(e.message, "error"); return; }
   note($("liveNote"), "");
-  const L = S.live = { opened: false, ready: false, tokens: [], t0: performance.now(), ws: null, mic: null, n: 0 };
+  // the whole start message and the labels are fixed now, before the permission prompt: the page may change meanwhile
+  const start = { type: "start", key: S.key, mode: mode, lookahead: Number($("lookahead").value) };
+  if (mode === "dec-stream") { start.lang = $("lang").value; start.itn = $("itn").checked; start.pnc = $("pnc").checked; }
+  if (wbLive) {
+    start.word_boost = wbLive; start.boost = Number($("boostScale").value);
+    if (mode === "ctc-stream") start.ctc_beam = Number($("ctcBeam").value);
+  }
+  const setup = S.setup && S.setup.label + ", live";
+  const L = S.live = { opened: false, ready: false, tokens: [], t0: performance.now(), ws: null, mic: null, n: 0,
+                       gotError: false };
   $("live").textContent = "Stop live"; $("live").classList.remove("secondary");
   $("out").textContent = ""; $("facts").innerHTML = ""; $("tables").innerHTML = "";
   setStatus("Waiting for microphone permission");
@@ -342,14 +479,12 @@ $("live").addEventListener("click", async () => {
   setStatus("Connecting");
   ws.onopen = () => {
     L.opened = true;
-    const start = { type: "start", key: S.key, mode: mode, lookahead: Number($("lookahead").value) };
-    if (mode === "dec-stream") { start.lang = $("lang").value; start.itn = $("itn").checked; start.pnc = $("pnc").checked; }
     ws.send(JSON.stringify(start));
   };
   ws.onerror = () => { if (!L.opened) liveFailed(L); };
   ws.onclose = (ev) => {
     if (L.mic) { L.mic.stop(); L.mic = null; }
-    if (ev.code === 1008 && L.opened) setStatus("The server refused the stream (key, options or pace).", "error");
+    if (ev.code === 1008 && L.opened && !L.gotError) setStatus("The server refused the stream (key, options or pace).", "error");
     if (S.live === L) resetLive();
   };
   ws.onmessage = (ev) => {
@@ -362,14 +497,16 @@ $("live").addEventListener("click", async () => {
       $("out").textContent = d.text;
       L.tokens = L.tokens.concat(d.tokens);
     } else if (d.type === "final") {
-      render({ text: d.text, audio_seconds: d.audio_seconds, token_times: d.token_times, mode: "live " + mode,
-               lookahead: Number($("lookahead").value), segments: d.segments, guards: d.guards },
+      render({ setup: setup, text: d.text, audio_seconds: d.audio_seconds,
+               token_times: d.token_times, mode: "live " + mode,
+               lookahead: start.lookahead, segments: d.segments, guards: d.guards },
              (performance.now() - L.t0) / 1000);
       const why = { limit: "Stopped: the stream reached the server's length limit.",
                     idle: "Stopped: no audio reached the server for a while.",
                     session_limit: "Stopped: the session reached the server's time limit." };
       setStatus(why[d.reason] || "Done");
     } else if (d.type === "error") {
+      L.gotError = true;
       setStatus(d.error === "busy" ? "All live sessions are in use. Try again in a moment." : "Server: " + d.error, "error");
     }
   };
@@ -390,7 +527,15 @@ function stopLive() {
   if (L.ws && L.ws.readyState === WebSocket.OPEN) { L.ws.send(JSON.stringify({ type: "stop" })); setStatus("Finishing"); }
   else { if (L.ws) L.ws.close(); resetLive(); }
 }
-function resetLive() { S.live = null; $("live").textContent = "Start live"; $("live").classList.add("secondary"); }
+function resetLive() {
+  S.live = null; $("live").textContent = "Start live"; $("live").classList.add("secondary"); syncLive();
+}
+function syncLive() {                                  // Stop live always works; Start live only on a streaming setup
+  const m = $("mode").value, canLive = liveModes().includes(m) && !!S.setup && S.setup.streaming;
+  $("live").disabled = !S.live && (!(S.help && S.help.server.live) || !window.isSecureContext || !navigator.mediaDevices
+                                   || !navigator.mediaDevices.getUserMedia || !canLive);
+  $("live").title = S.live || canLive ? "" : "Live needs a streaming setup";
+}
 
 // ---------------------------------------------------------------- output
 function fmt(x) { return x === null || x === undefined ? "n/a" : Number(x).toFixed(2); }
@@ -418,7 +563,8 @@ function render(d, wall) {
   fact("Audio length", fmt(d.audio_seconds) + " s");
   fact("Wall time", fmt(wall) + " s");
   if (d.seconds !== undefined) fact("Server time", fmt(d.seconds) + " s");
-  if (d.mode) fact("Mode", d.mode + (d.lookahead !== undefined ? ", look-ahead " + d.lookahead : ""));
+  if (d.setup) fact("Setup", d.setup);
+  if (d.mode) fact("Mode", d.mode + (d.decode ? ", " + d.decode : "") + (d.lookahead !== undefined ? ", look-ahead " + d.lookahead : ""));
   if (d.align_ok === false) fact("Alignment", "failed for at least one window (times empty)");
   if (d.guards) fact("Decoder guards", Object.keys(d.guards).map((k) => k + " " + d.guards[k]).join(", "));
   if (d.segments && d.segments.length)

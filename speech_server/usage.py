@@ -26,6 +26,9 @@ QUERY_PARAMS = {
              "doc": "decoder (attention decoder, best accuracy), ctc (CTC head only, fastest), ctc-stream (the "
                     "streaming encoder over the file, chunk by chunk, as a live stream would see it) or dec-stream "
                     "(preview: the streaming decoder on that encoder, a live stream's decoder output)"},
+    "decode": {"values": None, "modes": ["decoder"],
+               "doc": "the decoder's search, as served: greedy (Normal mode) or beam (Performance mode: more accurate, "
+                      "slower)"},
     "precision": {"values": None, "modes": None,
                   "doc": "numeric precision of the graphs; ctc-stream and dec-stream are fp32 only"},
     "lang": {"values": None, "modes": None,
@@ -58,7 +61,8 @@ QUERY_PARAMS = {
 MULTI_PARAMS = ("word_boost",)               # parameters that may repeat (every value counts)
 
 RESPONSE_KEYS = {
-    "mode": "the mode that ran", "precision": "the precision that ran", "text": "the transcript",
+    "mode": "the mode that ran", "precision": "the precision that ran",
+    "decode": "decoder mode: the search that ran (greedy | beam)", "text": "the transcript",
     "windows": "number of <= 30 s windows the file was cut into (ctc-stream, dec-stream: 1)",
     "segments": "[{start, end, text}] per window, seconds (decoder: also capped = hit the token cap; dec-stream: one "
                 "per decoder segment, with reason = end | endpoint | max_segment | eot | max_len | pos_cap)",
@@ -76,7 +80,8 @@ RESPONSE_KEYS = {
     "error": "on failure: what went wrong; detail: the engine's message for an input it refused",
 }
 
-PUBLIC_FACTS = ("modes", "default_mode", "precisions", "default_precision", "lookaheads", "default_lookahead",
+PUBLIC_FACTS = ("modes", "default_mode", "precisions", "default_precision", "decodes", "default_decode",
+                "lookaheads", "default_lookahead",
                 "lookaheads_by_mode", "default_lookahead_by_mode",
                 "langs", "defaults", "timestamps_by_mode", "decode", "live", "live_modes", "max_stream_seconds",
                 "max_body_mb",
@@ -93,6 +98,8 @@ def _values(name: str, facts: dict, mode: str | None = None):
         return sorted({p for ps in facts["precisions"].values() for p in ps})
     if name == "lang":
         return ["auto"] + list(facts.get("langs", []))
+    if name == "decode":
+        return list(facts.get("decodes") or [])
     if name == "lookahead":
         if mode and mode in (facts.get("lookaheads_by_mode") or {}):
             return [str(x) for x in facts["lookaheads_by_mode"][mode]]
@@ -111,6 +118,8 @@ def _default(name: str, facts: dict):
         return facts["default_mode"]
     if name == "precision":
         return facts["default_precision"]
+    if name == "decode":
+        return facts.get("default_decode")
     if name == "lookahead":
         return None if facts.get("default_lookahead") is None else str(facts["default_lookahead"])
     if name == "lang":
@@ -176,6 +185,11 @@ def parse_query(qs: dict, facts: dict) -> tuple[str, str, dict]:
         if q["lookahead"].strip() not in _values("lookahead", facts, mode):
             raise ValueError(f"lookahead must be one of {_values('lookahead', facts, mode)} for mode {mode}")
         opts["lookahead"] = int(q["lookahead"])
+    if "decode" in q:
+        dv = q["decode"].strip().lower()
+        if dv not in (facts.get("decodes") or []):
+            raise ValueError(f"decode must be one of {facts.get('decodes') or []} for mode {mode}")
+        opts["decode"] = dv                  # picks the engine (cli); not an engine option
     opts.update(_boost_query(q))
     return mode, prec, opts
 
@@ -309,6 +323,12 @@ def examples(facts: dict) -> list[str]:
         ts = "&timestamps=token" if "token" in tbm["decoder"] else ""
         ex.append('curl -s -H "Authorization: Bearer $KEY" --data-binary @audio.wav '
                   f'"https://HOST/v1/transcribe?mode=decoder&lang=th&itn=true&pnc=true{ts}"')
+    if "beam" in (facts.get("decodes") or []) and len(facts["decodes"]) > 1:
+        ex.append('curl -s -H "Authorization: Bearer $KEY" --data-binary @audio.wav '
+                  '"https://HOST/v1/transcribe?mode=decoder&decode=beam"')
+    if facts.get("word_boost_modes"):
+        ex.append('curl -s -H "Authorization: Bearer $KEY" --data-binary @audio.wav '
+                  f'"https://HOST/v1/transcribe?mode={facts["word_boost_modes"][0]}&word_boost=Acme%20Corp&boost=1"')
     if "ctc" in facts["modes"]:
         ex.append('curl -s -H "Authorization: Bearer $KEY" --data-binary @audio.wav '
                   '"https://HOST/v1/transcribe?mode=ctc&timestamps=token"')
@@ -331,6 +351,9 @@ def help_markdown(facts: dict) -> str:
     lines.append(f"- modes: {', '.join(s['modes'])} (default {s['default_mode']})")
     for m, ps in s["precisions"].items():
         lines.append(f"- precisions for {m}: {', '.join(ps)}")
+    if s.get("decodes"):
+        lines.append(f"- decoder search (?decode=): {', '.join(s['decodes'])} (default {s['default_decode']}; greedy is "
+                     "Normal mode, beam is Performance mode)")
     for m, ts in s["timestamps_by_mode"].items():
         lines.append(f"- timestamps for {m}: {', '.join(ts)} (default {s['defaults']['timestamps'].get(m, 'none')})")
     if s.get("lookaheads_by_mode"):
@@ -358,8 +381,7 @@ def help_markdown(facts: dict) -> str:
                  "live stream; 50 characters each)" if wbm else ""))
     cap = (f"; ctc-stream / live CTC: at most {s.get('max_stream_seconds')} s per stream"
            if s.get("max_stream_seconds") is not None else "")
-    lines.append(f"- upload limits: {s.get('max_body_mb')} MB, {s.get('max_audio_seconds')} s of audio{cap}; decode: "
-                 f"{s.get('decode')}")
+    lines.append(f"- upload limits: {s.get('max_body_mb')} MB, {s.get('max_audio_seconds')} s of audio{cap}")
     if s.get("live"):
         lines.append(f"- live sessions: {s.get('max_streams')} at once; idle after {s.get('live_idle_seconds')} s "
                      f"without audio ({s.get('live_first_audio_seconds')} s for the first audio); at most "

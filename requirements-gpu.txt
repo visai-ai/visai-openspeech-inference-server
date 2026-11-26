@@ -1,6 +1,6 @@
 # GPU runtime (Dockerfile.gpu, or: pip install -r requirements-gpu.txt). onnxruntime-gpu 1.21 needs CUDA 12.x and
 # cuDNN 9; the CUDA libraries come from NVIDIA's pip wheels below (no system CUDA toolkit needed). These are the CUDA
-# 12.4 builds, so the image runs on NVIDIA drivers >= 550; newer drivers work too.
+# 12.4 builds, so the image runs on NVIDIA drivers >= 535 (CUDA 12 minor-version compatibility).
 onnxruntime-gpu==1.21.1
 numpy==2.2.4
 sentencepiece==0.2.2

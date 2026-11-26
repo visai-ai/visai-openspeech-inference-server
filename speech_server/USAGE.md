@@ -24,6 +24,7 @@ long"`): retrying cannot help, split the file.
 | parameter | values | default | what it does |
 |---|---|---|---|
 | `mode` | `decoder`, `ctc`, `ctc-stream`, `dec-stream` (as served) | the server's default | `decoder`: attention decoder, best accuracy. `ctc`: CTC head only, fastest. `ctc-stream`: the streaming encoder run over the file chunk by chunk, as a live stream would see it. `dec-stream` (preview): the streaming decoder on that encoder, what a live decoder stream would write (see "Streaming decoder" below) |
+| `decode` | as served (`greedy`, `beam`) | the server's default | `decoder` only: the decoder's search; `greedy` is Normal mode, `beam` is Performance mode (more accurate, slower) |
 | `precision` | as served (`fp32`, `fp16`, ...) | first served | numeric precision; `ctc-stream` and `dec-stream` are `fp32` only |
 | `lang` | `auto` or a language code (`th`, `en`, `zh`, ...; any case) | the server's default (usually `auto`) | language prompt for the decoder; CTC modes ignore it |
 | `itn` | `true`, `false` | the server's default (usually `false`) | `decoder` / `dec-stream` only: written form (numbers as digits); `false` gives the spoken form |
@@ -33,7 +34,7 @@ long"`): retrying cannot help, split the file.
 
 The live section at the end of this page lists the actual values and defaults. A value the server does not serve, a
 blank value, or a parameter that does not apply to the chosen mode (`itn` / `pnc` outside `decoder` / `dec-stream`,
-`lookahead` outside `ctc-stream` / `dec-stream`) is refused with HTTP 400 and a message. Unknown parameters are ignored, and a repeated parameter
+`lookahead` outside `ctc-stream` / `dec-stream`) is refused with HTTP 400 and a message (likewise `decode` outside `decoder`). Unknown parameters are ignored, and a repeated parameter
 takes its first value (except `word_boost`, where every value counts).
 
 ### Request validation (strict)
@@ -63,6 +64,7 @@ a typo such as `?lang=tha` would otherwise give you automatic language detection
 | key | when | meaning |
 |---|---|---|
 | `mode`, `precision` | always | what ran |
+| `decode` | `decoder` | the decoder's search that ran (`greedy` or `beam`) |
 | `text` | always | the transcript |
 | `windows` | always | number of windows (at most 30 s each; `ctc-stream`, `dec-stream`: 1) |
 | `segments` | always | `[{start, end, text}]` per window in seconds; decoder rows also have `capped` (the token cap was hit, likely a repetition loop); `dec-stream`: one row per decoder segment, with `reason` (see below) |
@@ -74,6 +76,8 @@ a typo such as `?lang=tha` would otherwise give you automatic language detection
 | `guards` | `dec-stream` | counts over its decoder segments: `eot_mid`, `wait_at_end`, `pos_cap`, `max_len`, and `burst_max` (most tokens out of one chunk) |
 
 Errors: `{"error": ...}` with 400 (bad request or audio; `detail` explains an input the server refused), 401 (key),
+414 (the URL is too long: a long `word_boost` list in Thai or Chinese takes about 9 bytes per character once
+percent-encoded, so keep lists short; some proxies limit URLs to about 8 KB),
 413 (`"too large"` body or `"too long"` audio: retrying cannot help), 503 (`"error": "busy"`: the server is busy with
 other requests or connections, or could not start its decoder, right now; retry after a few seconds) or 500. A file
 whose decoding takes longer than the server's decode time limit (5 min by default) is refused with 400 ("decode timed

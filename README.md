@@ -29,7 +29,7 @@ cd speech-server
 
 # CPU
 docker build -f Dockerfile.cpu -t speech-server:cpu .
-# GPU (needs the NVIDIA driver >= 550 and the NVIDIA Container Toolkit on the host)
+# GPU (needs the NVIDIA driver >= 535 and the NVIDIA Container Toolkit on the host)
 docker build -f Dockerfile.gpu -t speech-server:gpu .
 
 export SPEECH_API_KEY="$(openssl rand -hex 24)"   # clients must send this key (at least 16 characters)
@@ -68,7 +68,7 @@ several on one port and choose per request with `?mode=`.
 | | Flash mode | Normal mode (default) | Performance mode |
 |---|---|---|---|
 | What runs | encoder + CTC head | encoder + attention decoder, greedy | encoder + attention decoder, beam search |
-| Settings | `MODES=ctc` (offline) or `MODES=ctc-stream` (streaming) | `MODES=decoder` | `MODES=decoder DECODE=beam BEAM=4` |
+| Settings | `MODES=ctc` (offline) or `MODES=ctc-stream` (streaming) | `MODES=decoder` | `MODES=decoder DECODE=beam BEAM=4`, or per request with `DECODES=greedy,beam` and `?decode=beam` |
 | Speed | fastest | 1.1-1.4x slower than Flash | about 2x slower than Normal on GPU |
 | Accuracy | lowest of the three | better than Flash | small further gain over Normal |
 | Repetition loops | cannot happen | possible (see [Limitations](#limitations)) | possible, less often |
@@ -99,11 +99,17 @@ heuristics). It is the default and the best balance for most uses. It can also w
 and the slowest; use it on a GPU when accuracy matters more than throughput.
 
 Serving several modes on one port, for example `MODES=decoder,ctc`, lets each request choose (`?mode=ctc`); the first
-mode is the default. With `SHARE_ENCODER=true` (the default) the modes share one copy of the encoder, so this costs
-little extra memory: see [Encoder sharing](#encoder-sharing).
+mode is the default. Normal and Performance can be served side by side too: `DECODES=greedy,beam` (`--decodes`) loads
+a second decoder engine (sharing the encoder) and each decoder request picks with `?decode=greedy` or `?decode=beam`
+(the first listed is the default). A server for every setup:
+`MODES=decoder,ctc,ctc-stream,dec-stream DECODES=greedy,beam` with a streaming package (`STREAM_MODEL_*`). With `SHARE_ENCODER=true` (the default) the modes, and the two decoder
+searches, share one copy of the encoder, so this costs little extra memory: see [Encoder sharing](#encoder-sharing).
 
 A streaming decoder mode (`dec-stream`, preview) is also available when the streaming package includes a streaming
 decoder; see `GET /help`.
+
+The demo page (`GET /demo`) shows these setups as a grid, Flash / Normal / Performance by offline / streaming, with
+the combinations this server does not offer greyed out, and a word-boost box where the chosen setup supports it.
 
 ### Encoder sharing
 
@@ -112,7 +118,8 @@ The encoder is the largest part of the model. When one server runs both the deco
 - `--share-encoder` / `SHARE_ENCODER=true` (default): one encoder session serves both modes; one copy of the encoder
   weights in memory. CTC requests use the full encoder graph and ignore the decoder's inputs it also produces, so they
   are slightly slower than with a dedicated CTC graph. The streaming modes (`ctc-stream`, `dec-stream`) likewise share
-  one streaming encoder.
+  one streaming encoder. With `DECODES=greedy,beam`, the beam engine also reuses the greedy engine's encoder and the
+  decoder graphs both open (with word boost on, greedy already holds beam's top-k graphs).
 - `--no-share-encoder` / `SHARE_ENCODER=false`: each mode loads its own encoder (CTC uses the lighter CTC-only graph,
   unless word boost is on and the package has the `ctc_lp` graph: boosted CTC needs the full encoder's output).
   Uses about one more encoder's worth of memory (measured on an A100 at fp16: about 1.8 GB for decoder + CTC shared,
@@ -275,8 +282,13 @@ saved with `huggingface-cli login`, if there is one. Pin
 ## Installation without Docker
 
 Requirements: Linux x86_64 (macOS and Windows may work for CPU but are not tested), Python 3.10-3.12, and for GPU an
-NVIDIA GPU of compute capability 7.0 or newer (V100, T4, A10, A100, L4, H100, RTX 20xx and newer) with driver >= 550.
+NVIDIA GPU of compute capability 7.0 or newer (V100, T4, A10, A100, L4, H100, RTX 20xx and newer) with driver >= 535 (CUDA 12 minor-version compatibility; 550 or newer recommended).
 ffmpeg is optional: it adds M4A / MP4 / WebM / AAC / AMR uploads (WAV, FLAC, OGG and MP3 work without it).
+
+GPU memory: the encoder runs a whole batch of 30 s windows at once (`--batch-size`, `--max-batch-seconds`), inside the
+cap `--gpu-mem-limit-mb`, which also limits the seconds per batch (about twice as tightly for fp32 graphs as for fp16).
+If a GPU still runs out of memory on dense 30 s audio, lower `--max-batch-seconds` (for example 120-180), or raise the
+cap toward the GPU's size so ONNX Runtime may use more of it (for example 28000 on a 32 GB GPU).
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
@@ -321,6 +333,7 @@ serve --help` lists every flag.
 | `PRECISION` / `PRECISIONS` | `--precision` / `--precisions` | `fp16` on GPU if the package has fp16 graphs, else `fp32` | numeric precision (on CPU the default is fp32; fp16 asked for explicitly runs, but slowly) |
 | `MODE` / `MODES` | `--mode` / `--modes` | `decoder` | served modes, first is the default: `decoder`, `ctc`, `ctc-stream`, `dec-stream` |
 | `DECODE`, `BEAM` | `--decode`, `--beam` | `greedy`, `4` | decoder search (Performance mode: `beam`; beam 1-16) |
+| `DECODES` | `--decodes` | `DECODE` | decoder searches served per request (`?decode=`), e.g. `greedy,beam`; the first is the default |
 | `SHARE_ENCODER` | `--share-encoder` / `--no-share-encoder` | `true` | see [Encoder sharing](#encoder-sharing) |
 | `THREADS` | `--threads` | all cores | CPU threads per engine (set it to your container's CPU limit) |
 | `LANG_DEFAULT` | `--lang` | `auto` | default language prompt (`auto`, `th`, `en`, `zh`) |
@@ -338,7 +351,8 @@ Other limits are flags with safe defaults (see `--help`): upload size (`--max-bo
 Full reference: `GET /help` on a running server (Markdown; `?format=json` for JSON), or
 [`speech_server/USAGE.md`](speech_server/USAGE.md). In short:
 
-- `POST /v1/transcribe` with the audio file as the request body. Query parameters: `mode`, `precision`, `lang`
+- `POST /v1/transcribe` with the audio file as the request body. Query parameters: `mode`, `decode` (where served),
+  `precision`, `lang`
   (`auto`, `th`, `en`, `zh`), `itn`, `pnc`, `timestamps` (`none`, `segment`, `token`), `lookahead` (streaming modes).
   The response has `text`, the per-window `segments`, `audio_seconds` and timing. Invalid values are a 400 with the
   reason; too long a file is a 413; a busy server is a 503 with `Retry-After`.

@@ -192,6 +192,8 @@ class Engine:
             raise ValueError("--mode dec-stream decodes greedily (the streaming decoder has no beam)")
         if mode in STREAM_MODES and precision != "fp32":
             raise ValueError(f"--mode {mode}: the streaming chunk graphs are fp32 only (use --precision fp32)")
+        self._sessions = {}               # (graph, session settings) -> session; shared with an encoder donor
+        self._sess_lock = threading.RLock()   # guards _sessions (shared with the donor too)
         self.timestamps = timestamps
         _check_ts(mode, timestamps)
         self.ort = ort
@@ -267,21 +269,32 @@ class Engine:
         if sh is not None and mode in ("decoder", "ctc"):
             if not (getattr(sh, "enc", None) is not None and getattr(sh, "enc_full", False)
                     and os.path.realpath(sh.model_dir) == os.path.realpath(model_dir)
-                    and sh.precision == precision and sh.want == self.want and sh.mode in ("decoder", "ctc")):
+                    and sh.precision == precision and sh.want == self.want and sh.mode in ("decoder", "ctc")
+                    and getattr(sh, "threads", None) == self.threads and getattr(sh, "graph_opt", None) == self.graph_opt
+                    and repr(getattr(sh, "providers", None)) == repr(self.providers)
+                    and getattr(sh, "gpu_mem_limit_mb", None) == self.gpu_mem_limit_mb):
                 raise ValueError("enc_share: the other engine must hold the full encoder of the same model package, "
-                                 "precision and device")
+                                 "precision, device and session settings (threads, graph_opt, provider options, "
+                                 "GPU memory cap)")
             self.enc, self.encoder_graph, self.enc_shared = sh.enc, sh.encoder_graph, True
+            # the decoder graphs are stateless sessions too (cross_kv, ctc_lp, gather, prefill / step): an engine that
+            # shares the encoder also reuses every graph the donor already opened with the same settings (e.g. the
+            # top-k graphs a greedy engine opened for word boost, for a beam engine); calls run under one lock
+            self._sessions, self._sess_lock = sh._sessions, sh._sess_lock
             cands = []
         for g in cands:                   # first graph that exists, loads and runs a probe batch
             role = f"{g}{'' if self.enc_full else '_ctc'}.{p}"
             if not self._has(role):
                 continue
+            sess = None
             try:
                 sess = self._session(role, threads)
                 self._probe(sess, mode)
                 self.enc, self.encoder_graph = sess, g
                 break
             except Exception as e:  # noqa: BLE001 (e.g. a contrib-op kernel missing for this architecture)
+                for k in [k for k, v in self._sessions.items() if v is sess]:
+                    del self._sessions[k]            # a graph that failed its probe is not kept in memory
                 errs.append(f"{role}: {type(e).__name__}: {str(e)[:160]}")
         if self.enc is None and mode not in STREAM_MODES:
             raise RuntimeError("no usable encoder graph: " + "; ".join(errs or ["none exported"]))
@@ -322,10 +335,10 @@ class Engine:
                                   and self._has(f"dec_prefill_topk.{dp}"))
                 if self.beam_topk:                  # in-graph top-16: (B, 16) to the host per step, not (B, V)
                     sfx = "_topk"
-                self.prefill = self._session(f"dec_prefill{sfx}.{dp}", self.decode_threads)
                 sg = step_graph if self._has(f"{step_graph}{sfx}.{dp}") else "dec_step1"
                 if step_graph == "lean":
                     sg = "dec_lean" if self._has(f"dec_lean{sfx}.{dp}") else "dec_step1"
+                self.prefill = self._session(f"dec_prefill{sfx}.{dp}", self.decode_threads)
                 self.step = self._session(f"{sg}{sfx}.{dp}", self.decode_threads)
                 self.gather_layers = self._session(f"gather_layers.{gp}", self.decode_threads)
             else:
@@ -348,7 +361,7 @@ class Engine:
             # per encoder batch (~12 MB per padded second at fp16 on this model, after ~0.7 GB of weights)
             self.kv_budget_mb = min(kv_budget_mb, 0.25 * gpu_mem_limit_mb)
             per_s = 12.0 * (2.0 if self.precision == "fp32" else 1.0)
-            cap = max(30.0, (0.45 * gpu_mem_limit_mb - 700.0) / per_s)
+            cap = max(30.0, (0.45 * gpu_mem_limit_mb - 700.0 * (2.0 if self.precision == "fp32" else 1.0)) / per_s)
             self.max_batch_seconds = min(self.max_batch_seconds or cap, cap)
         self.Tmax = 64 + self.max_new
         if timestamps == "token" and not self.token_timestamps:
@@ -380,7 +393,9 @@ class Engine:
                 self._ttext = boostlib.TokenText(self.detok.sp, self.spec.vocab.text0, self.spec.vocab.padded)
                 self._row_ids = np.array(self.spec.vocab.ctc_ids or list(range(self.spec.vocab.padded)), np.int64)
         self._boost_cache = boostlib.CACHE
-        self.lock = threading.Lock()
+        # one lock for the engines that share sessions (enc_share): calls into the shared graphs never overlap
+        self.lock = enc_share.lock if (self.enc_shared and getattr(enc_share, "lock", None) is not None) \
+            else threading.Lock()
         self.stats = Stats()
 
     # ------------------------------------------------------------ streaming CTC (mode ctc-stream)
@@ -562,10 +577,18 @@ class Engine:
         return isinstance(name, str) and os.path.isfile(os.path.join(self.model_dir, name))
 
     def _session(self, role: str, threads: int | None):
+        with self._sess_lock:             # one session per key, also when engines are built from several threads
+            return self._session_locked(role, threads)
+
+    def _session_locked(self, role: str, threads: int | None):
         ort = self.ort
         name = self.spec.graphs.get(role)
         if name is None:
             raise FileNotFoundError(f"{self.model_dir}: no graph for {role} in this model package")
+        # everything that makes a session differ: file, threads, optimisation, device and provider options, memory cap
+        key = (name, int(threads or 0), self.graph_opt, repr(self.providers), self.gpu_mem_limit_mb)
+        if key in self._sessions:
+            return self._sessions[key]
         so = ort.SessionOptions()
         so.graph_optimization_level = {"all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
                                        "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
@@ -588,6 +611,7 @@ class Engine:
         s = ort.InferenceSession(os.path.join(self.model_dir, name), sess_options=so, providers=providers)
         if s.get_providers()[0] != self.want:     # never fall back silently
             raise RuntimeError(f"{role}: asked for {self.want}, ORT gave {s.get_providers()}")
+        self._sessions[key] = s
         return s
 
     def _ctc_cut(self, x: np.ndarray, lo: int, hi: int):
