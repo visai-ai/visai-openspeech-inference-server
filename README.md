@@ -285,8 +285,11 @@ Requirements: Linux x86_64 (macOS and Windows may work for CPU but are not teste
 NVIDIA GPU of compute capability 7.0 or newer (V100, T4, A10, A100, L4, H100, RTX 20xx and newer) with driver >= 535 (CUDA 12 minor-version compatibility; 550 or newer recommended).
 ffmpeg is optional: it adds M4A / MP4 / WebM / AAC / AMR uploads (WAV, FLAC, OGG and MP3 work without it).
 
-GPU memory: the encoder runs a whole batch of 30 s windows at once (`--batch-size`, `--max-batch-seconds`), inside the
-cap `--gpu-mem-limit-mb`, which also limits the seconds per batch (about twice as tightly for fp32 graphs as for fp16).
+GPU memory: the encoder runs a whole batch of 30 s windows at once (`--batch-size`, `--max-batch-seconds`), inside its
+share of `--gpu-mem-limit-mb`, which also limits the seconds per batch (about twice as tightly for fp32 graphs as for fp16).
+The value sets a cap per ONNX Runtime session (the encoder 45%, each decoder graph 2 to 10%) plus at most 25% for decoder
+buffers, not one total for the process: the caps can add up to more, for example with word boost or with several modes
+or look-aheads loaded.
 Every 8th encoder batch (`--gpu-arena-shrink-every`, env `GPU_ARENA_SHRINK_EVERY`) the server releases the encoder's
 unused GPU memory from ONNX Runtime's arena, so memory does not fragment over a long run of differently sized batches
 (about 1.5% of throughput; `1` releases after every batch, about 5%). With `0` (never) and a `--gpu-mem-limit-mb` cap,

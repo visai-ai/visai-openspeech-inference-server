@@ -70,8 +70,10 @@ def engine_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--max-batch-seconds", type=float, help="cap on padded audio seconds per encoder batch")
     ap.add_argument("--decode-batch", type=int, help="decoder rows pooled across encoder batches (0: no pooling)")
     ap.add_argument("--kv-budget-mb", type=float, help="cap on decoder KV buffers per decode batch")
-    ap.add_argument("--gpu-mem-limit-mb", type=float, help="hard GPU memory cap: per-session arenas + KV buffers "
-                    "(a batch that does not fit fails loudly instead of growing into other jobs' memory)")
+    ap.add_argument("--gpu-mem-limit-mb", type=float, help="GPU memory budget: each ONNX Runtime session's arena "
+                    "is capped at a fixed share of it, and the decoder KV buffers at no more than 25%% (a batch that does not fit fails "
+                    "loudly instead of growing into other jobs' memory); the caps are per session, so their sum can exceed "
+                    "this value, for example with word boost or several modes or look-aheads loaded")
     ap.add_argument("--gpu-arena-shrink-every", type=_num(int, 0), metavar="N",
                     help="GPU: every Nth encoder run hands the encoder's unused arena memory back (stops memory "
                     "fragmenting into an out-of-memory error under --gpu-mem-limit-mb on long runs); 1 = every run "

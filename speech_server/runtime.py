@@ -10,6 +10,7 @@ max_new_tokens (default 448; at most the model's text-position limit). See the R
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -34,6 +35,52 @@ class TooLong(InputError):
     """The input is longer than this server takes at all (its length limit, or more decoded audio than the whole
     in-flight budget): the server's 413, never a retryable 503."""
 DEFAULT_MAX_NEW = 448
+
+# Share of gpu_mem_limit_mb given to each session's arena, by graph role prefix (first match wins). The encoder takes
+# most; decoder graphs a small share (the KV buffers are capped separately by kv_budget_mb, a share of the same total).
+# A role with no entry falls back to ARENA_DEFAULT and is reported once at session start. Each share caps one session:
+# with several modes or look-aheads loaded, the caps of all sessions can add up to more than gpu_mem_limit_mb.
+ARENA_FRACTIONS = (
+    ("encoder", 0.45),             # encoder*, encoder*_ctc, encoder_chunk_c*
+    ("cross", 0.10),               # cross_kv*
+    ("dec_stream_cross", 0.10),
+    ("dec_step", 0.06),
+    ("dec_lean", 0.06),
+    ("dec_prefill", 0.06),
+    ("dec_stream_prefill", 0.06),
+    ("dec_stream_step", 0.06),
+    ("ctc_lp", 0.02),
+    ("gather", 0.02),              # gather, gather_layers
+    ("frontend", 0.02),
+)
+ARENA_DEFAULT = 0.02
+
+
+def arena_fraction(role: str) -> tuple[float, bool]:
+    """(fraction of gpu_mem_limit_mb for this role's session arena, whether the role has an explicit entry)."""
+    for prefix, frac in ARENA_FRACTIONS:
+        if role.startswith(prefix):
+            return frac, True
+    return ARENA_DEFAULT, False
+
+
+_ARENA_WARNED: set = set()
+_ARENA_WARN_LOCK = threading.Lock()
+
+
+def _warn_unknown_role(role: str, limit_mb: float) -> None:
+    """Report once per process that a graph role has no explicit arena share. Never raises: a warning must not stop a
+    session from starting (closed or missing stderr)."""
+    with _ARENA_WARN_LOCK:
+        if role in _ARENA_WARNED:
+            return
+        _ARENA_WARNED.add(role)
+    try:
+        if sys.stderr is not None:
+            print(f"warning: graph role {role!r} has no GPU arena share; using the {ARENA_DEFAULT:.0%} default "
+                  f"({limit_mb * ARENA_DEFAULT:.0f} MB)", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def _canon_providers(providers) -> tuple:
@@ -280,7 +327,7 @@ class Engine:
             self._enc_ro = ort.RunOptions()
             self._enc_ro.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
         self.threads, self.decode_threads, self.graph_opt = threads, decode_threads or threads, graph_opt
-        self.gpu_mem_limit_mb = gpu_mem_limit_mb   # hard GPU memory cap (sessions + KV); None = no cap
+        self.gpu_mem_limit_mb = gpu_mem_limit_mb   # base budget for the per-session arena caps and the KV cap; None = no cap
         self.cut, self.cut_min_blank_ms = cut, cut_min_blank_ms   # long-form cut signal: "energy" | "ctc"
         p = precision
         cands = self.profile["encoder_graphs"] if encoder_graph == "auto" else [encoder_graph]
@@ -397,11 +444,11 @@ class Engine:
         self.decode_batch = decode_batch          # > 0: pool encoder batches into decode batches of up to this many rows
         self.kv_budget_mb = kv_budget_mb          # pooled decode batches are split to keep the KV buffers under this
         if gpu_mem_limit_mb:
-            # one budget: decoder KV + cross K/V buffers get 25%; the encoder arena (50%) bounds the padded seconds
+            # decoder KV + cross K/V buffers get at most 25%; the encoder arena (45%) bounds the padded seconds
             # per encoder batch (~12 MB per padded second at fp16 on this model, after ~0.7 GB of weights)
             self.kv_budget_mb = min(kv_budget_mb, 0.25 * gpu_mem_limit_mb)
             per_s = 12.0 * (2.0 if self.precision == "fp32" else 1.0)
-            cap = max(30.0, (0.45 * gpu_mem_limit_mb - 700.0 * (2.0 if self.precision == "fp32" else 1.0)) / per_s)
+            cap = max(30.0, (arena_fraction("encoder")[0] * gpu_mem_limit_mb - 700.0 * (2.0 if self.precision == "fp32" else 1.0)) / per_s)
             self.max_batch_seconds = min(self.max_batch_seconds or cap, cap)
         self.Tmax = 64 + self.max_new
         if timestamps == "token" and not self.token_timestamps:
@@ -651,10 +698,10 @@ class Engine:
         so.log_severity_level = 3
         providers = self.providers
         if self.gpu_mem_limit_mb and self.dev == "cuda":
-            # hard cap per session arena: the encoder takes most, decoder graphs a small share (the KV buffers are
-            # capped separately by kv_budget_mb, which is set to a share of the same total)
-            frac = (0.45 if role.startswith("encoder") else 0.10 if role.startswith("cross") else
-                    0.06 if role.startswith(("dec_step", "dec_lean", "dec_prefill")) else 0.02)
+            # hard cap per session arena (ARENA_FRACTIONS)
+            frac, known = arena_fraction(role)
+            if not known:
+                _warn_unknown_role(role, self.gpu_mem_limit_mb)
             p0 = dict(providers[0][1], gpu_mem_limit=str(int(self.gpu_mem_limit_mb * frac * 2 ** 20)))
             providers = [(providers[0][0], p0)] + list(providers[1:])
         s = ort.InferenceSession(os.path.join(self.model_dir, name), sess_options=so, providers=providers)
@@ -1180,9 +1227,9 @@ class Engine:
         # cross K/V (+ a compacted copy) and the uploaded encoder rows share the same budget
         per_row += (2 * 2 * self.L * self.H * T * self.dh * es) * nb + T * d * enc.itemsize
         step = max(1, min(B, int(self.kv_budget_mb * 2 ** 20 // per_row)))
-        if self.gpu_mem_limit_mb:                  # the cross-K/V graph's temporaries live in its 10% arena
+        if self.gpu_mem_limit_mb:                  # the cross-K/V graph's temporaries live in its arena (10%)
             tmp = (3 if self.cross3 else 6) * T * d * es       # per-row projection temporaries (per layer / all)
-            step = max(1, min(step, int((0.10 * self.gpu_mem_limit_mb - 64) * 2 ** 20 // tmp)))
+            step = max(1, min(step, int((arena_fraction("cross_kv")[0] * self.gpu_mem_limit_mb - 64) * 2 ** 20 // tmp)))
         for i in range(0, B, step):
             ov = self.ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(enc[i:i + step]), self.dev, 0)
             res = (self._beam2 if self.decode_kind == "beam" else self._greedy2)(ov, elen[i:i + step], prompt, st,
