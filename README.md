@@ -86,6 +86,10 @@ Your numbers depend on the GPU / CPU, the batch settings and the audio. The GPU 
 together; a single short request is dominated by fixed overhead (tens of milliseconds), so there the modes are much
 closer (on an A100, five 7-15 s clips one at a time: Flash 0.23 s, Normal 0.65 s, Performance 0.73 s in total).
 
+The GPU figures above come from a batch benchmark with fp16 graphs. The released model packages ship fp32 graphs.
+[LOADTEST.md](LOADTEST.md) reports end-to-end throughput and latency of this server with them, on one V100 and on 8 CPU
+cores, for files and live streams.
+
 **Flash mode** decodes the CTC head directly: no decoder, so no loops and the lowest latency. With a streaming model
 package, `ctc-stream` (and the live `/stream` WebSocket) gives partial results as audio arrives. The look-ahead
 (`?lookahead=0|4|13`, in 80 ms frames) trades latency for accuracy: 0 is the fastest to react, 13 (about 1.1 s) the
