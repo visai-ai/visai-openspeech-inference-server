@@ -90,6 +90,8 @@ The GPU figures above come from a batch benchmark with fp16 graphs. The released
 [LOADTEST.md](LOADTEST.md) reports end-to-end throughput and latency of this server with them, on one V100 and on 8 CPU
 cores, for files and live streams.
 
+![Throughput against concurrency of the released fp32 packages on one V100 and on 8 CPU cores](docs/loadtest/throughput.png)
+
 **Flash mode** decodes the CTC head directly: no decoder, so no loops and the lowest latency. With a streaming model
 package, `ctc-stream` (and the live `/stream` WebSocket) gives partial results as audio arrives. The look-ahead
 (`?lookahead=0|4|13`, in 80 ms frames) trades latency for accuracy: 0 is the fastest to react, 13 (about 1.1 s) the
